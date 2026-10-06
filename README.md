@@ -212,7 +212,7 @@ write them out for you.
 | `YT98_OUT` | `~/youtube98` | where finished `.mpg` files go (share this over SMB) |
 | `YT98_WIN_PATH` | `Z:\youtube98\` (Windows: `YT98_OUT`) | the same directory as the Win98 box sees it |
 | `YT98_PYTHON` | `/usr/bin/python3` (Windows: `python`) | interpreter used by the refresh endpoint |
-| `YT98_PROFILE` | `mpeg1` | encode profile, `mpeg1` or `xvid480` (see below) |
+| `YT98_PROFILE` | `mpeg1` | encode profile: `low`/`mid`/`high` (see below) |
 | `YT98_FEED` | `:ytrec` | feed source (see below) |
 | `YT98_LIMIT` | `150` | how many entries to ingest |
 | `YT98_YTDLP` | `~/.local/bin/yt-dlp` (Windows: `yt-dlp.exe` on PATH) | yt-dlp binary |
@@ -222,29 +222,63 @@ write them out for you.
 
 ### Encode profiles
 
-`node profiles.js` lists them and shows the exact filter chain.
+`node profiles.js` lists them and prints the resolved ffmpeg settings.
 
-| `YT98_PROFILE` | Output | Needs |
+| `YT98_PROFILE` | Alias | Output | Needs |
+|---|---|---|---|
+| `mpeg1` (default) | `low` | 352px MPEG-1, 25fps, MP2, `.mpg` | nothing — Win98SE ships a DirectShow MPEG-1 decoder |
+| `xvid512` | `mid` | 512px Xvid SP, 24fps, MP3, `.avi` | an Xvid/DivX codec or ffdshow on Win98 |
+| `xvid640` | `high` | 640px Xvid SP, 24fps, MP3, `.avi` | the same |
+
+`YT98_PROFILE=low|mid|high` works as well as the explicit names, and
+`xvid480` remains an alias for `xvid640` (its original name).
+
+The two Xvid profiles are **calibrated against files a Pentium II
+350 MHz with a Radeon 9200 is known to play**, so the ceiling is measured
+from both sides rather than guessed:
+
+| Reference file | | Result on that machine |
 |---|---|---|
-| `mpeg1` (default) | MPEG-1 352px wide, 25fps, MP2, `.mpg` | nothing — Win98SE ships a DirectShow MPEG-1 decoder |
-| `xvid480` | Xvid Simple Profile 640px wide, 24fps, MP3, `.avi` | an Xvid/DivX codec or ffdshow on Win98 |
+| Xvid SP 512x288, 768 kbps | 6.5 MB/min | smooth |
+| Xvid SP 640x368, 1400 kbps | 11.0 MB/min | "very subtle hiccups" |
 
-`xvid480` is calibrated against a file a **Pentium II 350 with a Radeon
-9200 is known to play**: Xvid Simple Profile, 640x368, 23.976fps,
-1400 kbps. This profile targets the same shape and lands a little under
-it (~6 MB/min against that file's ~11 MB/min), so it should sit inside
-proven-playable territory.
+On a 3:2 source the profiles produce roughly 4.6 / 5.1 / 6.2 MB/min
+respectively — `xvid512` sits under the smooth reference, `xvid640` well
+under the hiccuping one.
 
-Deliberate choices in that profile:
+Deliberate choices in both Xvid profiles:
 
-- **Simple Profile only** — no B-frames, no quarter-pixel, no GMC.
-  Advanced Simple Profile roughly doubles the decode cost and is what
-  makes "Xvid" files stutter on hardware this old.
+- **Simple Profile only** — `-bf 0 -flags -qpel`, so no B-frames, no
+  quarter-pixel, no GMC. Advanced Simple Profile roughly doubles the
+  decode cost and is most of why "Xvid" has a reputation for stuttering
+  on hardware this old.
 - **24fps cap.** Frame rate costs about as much as resolution on a CPU
   this slow. A 30fps source gets frame-dropped, which judders slightly;
   that trade is intentional.
-- Both output dimensions are padded to multiples of **16** so no
-  macroblock padding is left for the decoder to mishandle.
+- Both output dimensions are padded to a multiple of **16** so no
+  macroblock padding is left for a decoder to mishandle.
+
+#### Tuning without editing code
+
+Every knob overrides the chosen profile, so you can calibrate to your own
+machine:
+
+| Variable | Overrides |
+|---|---|
+| `YT98_WIDTH`, `YT98_HEIGHT` | the box the video is fitted inside |
+| `YT98_FPS` | frame-rate cap |
+| `YT98_VB`, `YT98_AB` | video / audio bitrate in kbps |
+| `YT98_VCODEC`, `YT98_VTAG`, `YT98_ACODEC`, `YT98_EXT` | codecs and container |
+
+```sh
+YT98_PROFILE=xvid640 YT98_FPS=20   node worker.js   # same size, less CPU
+YT98_PROFILE=xvid640 YT98_VB=1200  node worker.js   # same size, lower bitrate
+YT98_PROFILE=xvid640 YT98_WIDTH=576 node worker.js  # between the presets
+```
+
+Bad values are reported and ignored rather than being fatal. If playback
+stutters, the levers in order of effect are **fps**, then **width**, then
+**bitrate**.
 
 **Switching profiles does not orphan existing files.** Anything looking
 for output accepts every known extension, and the page is told each
