@@ -17,6 +17,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const { spawn } = require('child_process');
 
 const BASE = __dirname;
@@ -24,18 +25,32 @@ const PORT = parseInt(process.env.YT98_PORT || '8098', 10);
 const FEED_JSON = path.join(BASE, 'cache', 'feed.json');
 const THUMB_DIR = path.join(BASE, 'thumbs');
 const JOB_DIR = path.join(BASE, 'cache', 'jobs');
-const OUT_DIR = process.env.YT98_OUT || '/media/archive/youtube98';
+// Sane default on both platforms; override with YT98_OUT. On Windows this
+// is the folder you share over SMB for the retro box to map.
+const OUT_DIR = process.env.YT98_OUT || path.join(os.homedir(), 'youtube98');
 const PER_PAGE = 12; // 4 across x 3 down — fits 800x600 without scrolling much
 const COLS = 4;
 
-// Drive letter as mapped on the Win98 box: \\phobos\archive -> Z:
-const WIN_PATH = process.env.YT98_WIN_PATH || 'Z:\\youtube98\\';
+/*
+ * The output directory as the *Win98 box* sees it, used for the
+ * youtube98: links and the copy-path button.
+ *
+ * On Linux the server's path and the retro box's path differ (the share
+ * is mapped to a drive letter), so this has to be configured separately.
+ * On Windows the server is usually the machine holding the files, so
+ * OUT_DIR itself is a sensible default.
+ */
+const WIN_PATH = process.env.YT98_WIN_PATH ||
+  (process.platform === 'win32' ? OUT_DIR + '\\' : 'Z:\\youtube98\\');
 
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 
 // --- manual feed refresh --------------------------------------------------
 
-const PYTHON = process.env.YT98_PYTHON || '/usr/bin/python3';
+// `python` on Windows (that is what python.org installs), `python3`
+// elsewhere. Override with YT98_PYTHON.
+const PYTHON = process.env.YT98_PYTHON ||
+  (process.platform === 'win32' ? 'python' : '/usr/bin/python3');
 const REFRESH_SCRIPT = path.join(BASE, 'refresh-feed.py');
 
 /*

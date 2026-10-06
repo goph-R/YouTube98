@@ -25,12 +25,19 @@ const retention = require('./retention');
 
 const BASE = __dirname;
 const JOB_DIR = path.join(BASE, 'cache', 'jobs');
-const OUT_DIR = process.env.YT98_OUT || '/media/archive/youtube98';
+const OUT_DIR = process.env.YT98_OUT || path.join(os.homedir(), 'youtube98');
 const TMP_DIR = path.join(OUT_DIR, '.tmp');
 const LOCK = path.join(BASE, 'cache', 'worker.lock');
 
 const COOKIES = process.env.YT98_COOKIES || path.join(os.homedir(), 'cookies.txt');
-const YTDLP = process.env.YT98_YTDLP || path.join(os.homedir(), '.local/bin/yt-dlp');
+/*
+ * On Windows yt-dlp.exe is expected on PATH (that is how winget and the
+ * released binary are normally used). Elsewhere, the standalone binary
+ * installed into ~/.local/bin.
+ */
+const YTDLP = process.env.YT98_YTDLP || (process.platform === 'win32'
+  ? 'yt-dlp.exe'
+  : path.join(os.homedir(), '.local/bin/yt-dlp'));
 const POLL_MS = 2000;
 
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
@@ -144,6 +151,10 @@ function run(cmd, args, onLine, job) {
       if (killed || !cancelRequested(job.id)) return;
       killed = true;
       log(job.id + ' cancel requested, terminating ' + cmd);
+      // Windows has no real SIGTERM: Node maps kill() to
+      // TerminateProcess, so the child dies abruptly rather than
+      // cleanly. Harmless here — a cancelled job's partial output is
+      // discarded either way.
       try { p.kill('SIGTERM'); } catch (e) { /* already gone */ }
       // yt-dlp and ffmpeg both exit promptly on TERM; this is a backstop.
       hardTimer = setTimeout(() => {

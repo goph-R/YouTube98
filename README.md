@@ -3,8 +3,9 @@
 Browse your YouTube feed and watch videos on a **Windows 98 machine**, in
 **Internet Explorer 5**, over plain HTTP.
 
-A small server on a modern Linux box does everything the retro machine
-cannot: HTTPS, the modern YouTube page, and H.264/VP9 decoding. The Win98
+A small server on a modern machine (Linux, macOS or Windows) does
+everything the retro machine cannot: HTTPS, the modern YouTube page, and
+H.264/VP9 decoding. The Win98
 box only ever receives HTML 4.01 and pre-transcoded MPEG-1 files. Clicking
 **Download** queues a video; when it is ready, **Play** launches it in a
 local player.
@@ -13,14 +14,14 @@ Developed against a Pentium II 350 MHz with 192 MB RAM and an ATi Radeon
 9200, running Win98SE and IE 5.0. MPEG-1 at 352x208 plays smoothly there.
 
 ```
-  Win98SE box (IE5)                    server (Linux)
+  Win98SE box (IE5)                    server (Linux/macOS/Windows)
   ---------------------                ----------------------------
   feed page        <------ HTTP ------ node server.js  :8098
   thumbnails                           yt-dlp   (feed + download)
   XMLHTTP polling                      cookies.txt (exported by you)
                                        ffmpeg   (transcode to MPEG-1)
                                        worker   (serial job queue)
-  Z:\youtube98\  <--- SMB share -----  /media/archive/youtube98/
+  Z:\youtube98\  <--- SMB share -----  $YT98_OUT
   player via youtube98: protocol
 ```
 
@@ -30,7 +31,8 @@ The retro box never does TLS, never sees H.264, and never runs Python.
 
 ## Requirements
 
-**Server:** Linux, Node.js (no npm packages — stdlib only), Python 3,
+**Server:** Linux, macOS or Windows 10/11 with Node.js (no npm packages
+— stdlib only), Python 3,
 `ffmpeg`, and [`yt-dlp`](https://github.com/yt-dlp/yt-dlp). Use a current
 yt-dlp; distro packages are often too old to work against YouTube.
 
@@ -42,17 +44,65 @@ SMB share mapped to the output directory.
 
 ## Install
 
+The server side runs on **Linux, macOS or Windows 10/11** — anywhere Node,
+Python and ffmpeg run. The Win98 box is always the client.
+
+### Linux / macOS
+
 ```sh
 git clone https://github.com/goph-R/YouTube98.git
 cd YouTube98
 
-# 1. Put a cookies.txt somewhere OUTSIDE this directory (see below)
-# 2. Build the feed
-./refresh-feed.py
+./install.sh                      # check deps, fetch yt-dlp, make dirs
+./install.sh --systemd            # ...and install systemd --user units
+./install.sh --help               # all options
+```
 
-# 3. Run the server and the worker
-node server.js &
-node worker.js &
+`--systemd` writes four `systemd --user` units (server, worker, feed
+service + 30-minute timer) with your paths baked in, enables lingering so
+they survive logout, and starts them. No root required: yt-dlp goes to
+`~/.local/bin`.
+
+### Windows 10/11
+
+```powershell
+git clone https://github.com/goph-R/YouTube98.git
+cd YouTube98
+
+.\install.ps1                     # check deps and create directories
+.\install.ps1 -InstallDeps        # install anything missing via winget
+.\install.ps1 -Tasks              # register scheduled tasks (logon + 30min)
+.\install.ps1 -Share -Firewall    # SMB share + open the port (needs admin)
+Get-Help .\install.ps1 -Full
+```
+
+`-Tasks` generates `run-youtube98.cmd`, which holds the configuration —
+scheduled tasks inherit no shell environment, so edit that file to change
+settings afterwards.
+
+> The PowerShell installer is **not tested on Windows** — it was written
+> on Linux and only statically checked. Read it before running, and please
+> report what breaks.
+
+**Windows-specific caveats:**
+
+- **Windows 98 needs SMB1** to reach a modern Windows share. Modern
+  Windows disables it by default, and enabling it is a real security
+  decision, not a checkbox. A Linux host with Samba configured for SMB1
+  is the gentler option.
+- **NTFS last-access timestamps are disabled by default**, so retention
+  effectively orders by modification time rather than "least recently
+  watched". It still enforces the size cap correctly.
+- **There is no real `SIGTERM`.** Cancelling a job kills the child via
+  `TerminateProcess`, so ffmpeg dies abruptly instead of cleanly — which
+  is harmless here, since a cancelled job's partial output is discarded.
+
+### Manual start (any platform)
+
+```sh
+python3 refresh-feed.py     # build the feed
+node server.js              # the web server
+node worker.js              # the download/transcode queue
 ```
 
 Then open `http://<server>:8098/` on the Win98 box.
@@ -105,41 +155,33 @@ The `.reg` file uses the `REGEDIT4` header on purpose: the
 Without the handler, clicking a **thumbnail** copies the file's Windows
 path to the clipboard instead.
 
-### Running under systemd (no root needed)
+### Running as a service
 
-User units work well. Example:
+`./install.sh --systemd` (Linux) or `.\install.ps1 -Tasks` (Windows) sets
+this up. Two things that catch people out if you write the units by hand:
 
-```ini
-# ~/.config/systemd/user/youtube98-server.service
-[Service]
-WorkingDirectory=/path/to/YouTube98
-ExecStart=/usr/bin/node /path/to/YouTube98/server.js
-Restart=always
-[Install]
-WantedBy=default.target
-```
-
-Do the same for `worker.js`, plus a `oneshot` service and timer for
-`refresh-feed.py` (every 30 minutes suits it). Run
-`loginctl enable-linger $USER` so the units survive logout. If Node came
-from nvm, `ExecStart` must be the absolute versioned path — systemd gets no
-shell, so nvm's shell function is unavailable.
+- **nvm-installed Node needs an absolute, versioned `ExecStart` path** —
+  systemd gets no shell, so nvm's shell function is unavailable.
+- **`PATH` must be set explicitly** in the worker unit, because `ffmpeg`
+  is resolved from it and user services inherit no login environment.
 
 ---
 
 ## Configuration
 
-All via environment variables; the defaults reflect the author's setup.
+All via environment variables. Defaults are portable; the installers
+write them out for you.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `YT98_PORT` | `8098` | server port |
 | `YT98_COOKIES` | `~/cookies.txt` | Netscape cookie jar |
-| `YT98_OUT` | `/media/archive/youtube98` | where finished `.mpg` files go (export this over SMB) |
-| `YT98_WIN_PATH` | `Z:\youtube98\` | the same directory as the Win98 box sees it |
+| `YT98_OUT` | `~/youtube98` | where finished `.mpg` files go (share this over SMB) |
+| `YT98_WIN_PATH` | `Z:\youtube98\` (Windows: `YT98_OUT`) | the same directory as the Win98 box sees it |
+| `YT98_PYTHON` | `/usr/bin/python3` (Windows: `python`) | interpreter used by the refresh endpoint |
 | `YT98_FEED` | `:ytrec` | feed source (see below) |
 | `YT98_LIMIT` | `150` | how many entries to ingest |
-| `YT98_YTDLP` | `~/.local/bin/yt-dlp` | yt-dlp binary |
+| `YT98_YTDLP` | `~/.local/bin/yt-dlp` (Windows: `yt-dlp.exe` on PATH) | yt-dlp binary |
 | `YT98_KEEP_GB` | `20` | retention size cap |
 | `YT98_KEEP_DAYS` | `0` | optional age cap, 0 = off |
 | `YT98_THUMB_WORKERS` | `6` | parallel thumbnail fetches |

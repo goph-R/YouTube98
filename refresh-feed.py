@@ -42,7 +42,11 @@ THUMB_WORKERS = int(os.environ.get("YT98_THUMB_WORKERS", "6"))
 # Kept outside the project dir, the web root and the Samba share on purpose:
 # this file is an account credential. chmod 600.
 COOKIES = os.environ.get("YT98_COOKIES", os.path.expanduser("~/cookies.txt"))
-YTDLP = os.environ.get("YT98_YTDLP", os.path.expanduser("~/.local/bin/yt-dlp"))
+# yt-dlp.exe from PATH on Windows; the standalone binary in ~/.local/bin
+# elsewhere. Override with YT98_YTDLP.
+YTDLP = os.environ.get(
+    "YT98_YTDLP",
+    "yt-dlp.exe" if os.name == "nt" else os.path.expanduser("~/.local/bin/yt-dlp"))
 
 CACHE_DIR = os.path.join(BASE, "cache")
 THUMB_DIR = os.path.join(BASE, "thumbs")

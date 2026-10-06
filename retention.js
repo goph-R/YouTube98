@@ -21,9 +21,10 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 
 const BASE = __dirname;
-const OUT_DIR = process.env.YT98_OUT || '/media/archive/youtube98';
+const OUT_DIR = process.env.YT98_OUT || path.join(os.homedir(), 'youtube98');
 const TMP_DIR = path.join(OUT_DIR, '.tmp');
 const JOB_DIR = path.join(BASE, 'cache', 'jobs');
 
