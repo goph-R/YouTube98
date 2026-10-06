@@ -1,0 +1,18 @@
+# Runtime state and personal data — none of this belongs in the repo.
+
+# Your subscription list, your feed's video titles, job records.
+cache/
+
+# Downloaded YouTube thumbnails (not ours to redistribute, and they
+# reveal what you watch).
+thumbs/
+
+# Never commit a cookie jar. It is a live Google session: anyone who
+# reads it is logged into your account. Keep it outside this directory
+# entirely — see YT98_COOKIES in the README.
+cookies.txt
+*cookies*.txt
+
+# Logs / scratch
+*.log
+*.part

@@ -1,0 +1,1068 @@
+#!/usr/bin/env node
+/*
+ * youtube98 — server (plan section 3, step 2)
+ *
+ * Serves the feed page and thumbnails to IE5 on the Win98SE box over plain
+ * HTTP. No framework, no build step, no dependencies.
+ *
+ *   node server.js            # listens on 0.0.0.0:8098
+ *   YT98_PORT=9000 node server.js
+ *
+ * The /enqueue and /status endpoints land in step 3; the Download buttons
+ * are rendered but inert for now.
+ */
+
+'use strict';
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const BASE = __dirname;
+const PORT = parseInt(process.env.YT98_PORT || '8098', 10);
+const FEED_JSON = path.join(BASE, 'cache', 'feed.json');
+const THUMB_DIR = path.join(BASE, 'thumbs');
+const JOB_DIR = path.join(BASE, 'cache', 'jobs');
+const OUT_DIR = process.env.YT98_OUT || '/media/archive/youtube98';
+const PER_PAGE = 12; // 4 across x 3 down — fits 800x600 without scrolling much
+const COLS = 4;
+
+// Drive letter as mapped on the Win98 box: \\phobos\archive -> Z:
+const WIN_PATH = process.env.YT98_WIN_PATH || 'Z:\\youtube98\\';
+
+const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
+
+// --- manual feed refresh --------------------------------------------------
+
+const PYTHON = process.env.YT98_PYTHON || '/usr/bin/python3';
+const REFRESH_SCRIPT = path.join(BASE, 'refresh-feed.py');
+
+/*
+ * Public mode is a flag file rather than a per-run environment override.
+ *
+ * A one-shot override did not survive: the 30-minute timer runs with
+ * cookies and dragged the feed back out of fallback within half an hour,
+ * so "ignore cookies.txt" could not be stayed in. refresh-feed.py checks
+ * this file on every run, including the timer's.
+ *
+ * `?nocookies=1` sets it; a plain refresh clears it. The real cookies.txt
+ * is never touched either way.
+ */
+const PUBLIC_FLAG = path.join(BASE, 'cache', 'public-mode');
+
+function publicMode() {
+  return fs.existsSync(PUBLIC_FLAG);
+}
+
+function setPublicMode(on) {
+  try {
+    fs.mkdirSync(path.dirname(PUBLIC_FLAG), { recursive: true });
+    if (on) fs.writeFileSync(PUBLIC_FLAG, new Date().toISOString() + '\n');
+    else if (fs.existsSync(PUBLIC_FLAG)) fs.unlinkSync(PUBLIC_FLAG);
+  } catch (e) {
+    console.log('could not update public-mode flag: ' + e.message);
+  }
+}
+
+let refreshing = false;
+let lastRefresh = null;
+
+function truthy(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  return s === '1' || s === 'true' || s === 'yes' || s === 'on';
+}
+
+// --- text handling for a 1999 browser -------------------------------------
+
+/*
+ * Win98 fonts have no emoji and IE5's UTF-8 handling is not worth trusting
+ * with mixed scripts. Two-step defence:
+ *   1. drop code points Win98 cannot draw (astral plane, dingbats, arrows)
+ *   2. emit everything non-ASCII as a numeric character reference
+ * The response body therefore ends up pure ASCII and charset negotiation
+ * stops mattering, while Hungarian accents still render from the system font.
+ */
+function stripUndrawable(s) {
+  let out = '';
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    if (cp > 0xffff) continue;                    // emoji, astral symbols
+    if (cp >= 0xfe00 && cp <= 0xfe0f) continue;   // variation selectors
+    if (cp >= 0x2190 && cp <= 0x2bff) continue;   // arrows, dingbats, misc
+    if (cp >= 0x200b && cp <= 0x200f) continue;   // zero-width / bidi marks
+    out += ch;
+  }
+  return out;
+}
+
+function esc(raw) {
+  const s = stripUndrawable(String(raw == null ? '' : raw));
+  let out = '';
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    if (ch === '&') out += '&amp;';
+    else if (ch === '<') out += '&lt;';
+    else if (ch === '>') out += '&gt;';
+    else if (ch === '"') out += '&quot;';
+    else if (cp > 126 || cp < 32) out += '&#' + cp + ';';
+    else out += ch;
+  }
+  return out;
+}
+
+function clip(s, n) {
+  const t = String(s == null ? '' : s);
+  return t.length <= n ? t : t.slice(0, n - 1) + '\u2026';
+}
+
+function hms(sec) {
+  const s = Math.max(0, parseInt(sec, 10) || 0);
+  if (!s) return '';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const r = s % 60;
+  const pad = (n) => (n < 10 ? '0' + n : String(n));
+  return h ? h + ':' + pad(m) + ':' + pad(r) : m + ':' + pad(r);
+}
+
+function ago(ts) {
+  if (!ts) return 'unknown';
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (d < 90) return d + ' seconds ago';
+  if (d < 5400) return Math.round(d / 60) + ' minutes ago';
+  if (d < 172800) return Math.round(d / 3600) + ' hours ago';
+  return Math.round(d / 86400) + ' days ago';
+}
+
+// --- feed -----------------------------------------------------------------
+
+function readFeed() {
+  try {
+    return JSON.parse(fs.readFileSync(FEED_JSON, 'utf8'));
+  } catch (e) {
+    return { videos: [], error: 'feed.json unreadable: ' + e.message, stale_cookies: false };
+  }
+}
+
+// --- jobs -----------------------------------------------------------------
+
+function jobPath(id) {
+  return path.join(JOB_DIR, id + '.json');
+}
+
+function readJob(id) {
+  try {
+    return JSON.parse(fs.readFileSync(jobPath(id), 'utf8'));
+  } catch (e) {
+    return null;
+  }
+}
+
+/*
+ * State for one video, as the button needs it. An already-transcoded file
+ * on disk outranks any job record: that is what makes the page correct
+ * after a worker restart, a cache wipe, or a manual drop into OUT_DIR.
+ */
+function jobState(id) {
+  let haveFile = false;
+  try {
+    haveFile = fs.statSync(path.join(OUT_DIR, id + '.mpg')).size > 0;
+  } catch (e) { /* not downloaded yet, or deleted */ }
+
+  if (haveFile) return { state: 'READY', pct: 100, file: id + '.mpg' };
+
+  const job = readJob(id);
+  if (!job) return { state: 'NONE', pct: 0 };
+
+  /*
+   * The file is the source of truth for READY, in both directions.
+   *
+   * A job record saying READY with no file on disk is stale — the movie
+   * was deleted by hand, or will be by the retention policy. Reporting
+   * READY there left the button saying "Play", which launched the
+   * protocol handler onto a missing file. So treat it as never
+   * downloaded and offer Download again.
+   *
+   * Only READY is overridden: QUEUED/DOWNLOADING/CONVERTING legitimately
+   * have no file yet, and must not be reset mid-flight.
+   */
+  if (job.state === 'READY') return { state: 'NONE', pct: 0 };
+
+  return { state: job.state || 'NONE', pct: job.pct || 0, error: job.error || null };
+}
+
+/*
+ * Kick off a feed refresh and return immediately.
+ *
+ * Detached rather than awaited on purpose: a refresh takes 10-45s, which
+ * is long enough for IE5 to give up on the request. The caller gets a
+ * small page with a meta-refresh back to the feed instead.
+ */
+function startRefresh(nocookies) {
+  if (refreshing) return { started: false, reason: 'a refresh is already running' };
+
+  // Persist the choice before running, so the timer honours it too.
+  setPublicMode(nocookies);
+
+  let child;
+  try {
+    // Fixed argv, no interpolation of anything client-supplied.
+    child = spawn(PYTHON, [REFRESH_SCRIPT], {
+      cwd: BASE,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+  } catch (e) {
+    return { started: false, reason: 'could not start: ' + e.message };
+  }
+
+  refreshing = true;
+  const started = Date.now();
+  const mode = nocookies ? 'no-cookies (public RSS)' : 'normal (cookies)';
+  console.log('refresh started: ' + mode);
+
+  let tail = '';
+  const grab = (b) => { tail = (tail + String(b)).slice(-2000); };
+  child.stdout.on('data', grab);
+  child.stderr.on('data', grab);
+  child.on('error', (err) => { grab(String(err.message)); });
+  child.on('close', (code) => {
+    refreshing = false;
+    lastRefresh = {
+      mode: mode,
+      code: code,
+      seconds: Math.round((Date.now() - started) / 1000),
+      tail: tail.trim().split(/\r?\n/).slice(-3).join(' | ')
+    };
+    console.log('refresh finished: ' + mode + ' rc=' + code +
+                ' in ' + lastRefresh.seconds + 's');
+  });
+
+  return { started: true, mode: mode };
+}
+
+/*
+ * Request cancellation of an in-flight job.
+ *
+ * Only writes a flag: the worker owns the child processes and kills them
+ * itself. Returns the state the button should show next.
+ */
+function requestCancel(id) {
+  const job = readJob(id);
+  if (!job) return { state: 'NONE', pct: 0 };
+  if (!['QUEUED', 'DOWNLOADING', 'CONVERTING'].includes(job.state)) {
+    return { state: job.state, pct: job.pct || 0 };
+  }
+  /*
+   * A still-QUEUED job has no child process, so it can be cancelled here
+   * and now. Waiting for the worker meant the button sat on "Stopping..."
+   * for as long as the *current* job took — the serial worker only looks
+   * at the queue between jobs.
+   *
+   * `cancel` is set as well as the state: if the worker happened to pick
+   * this up in the same instant, it sees the flag on its next poll and
+   * aborts, so both paths converge on CANCELLED.
+   */
+  const instant = job.state === 'QUEUED';
+  job.cancel = true;
+  if (instant) {
+    job.state = 'CANCELLED';
+    job.pct = 0;
+    job.error = null;
+  }
+  job.updated = Math.floor(Date.now() / 1000);
+  const tmp = jobPath(id) + '.part';
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 1));
+  fs.renameSync(tmp, jobPath(id));
+  console.log('cancel requested for ' + id + (instant ? ' (was queued, cancelled immediately)' : ''));
+  return { state: instant ? 'CANCELLED' : 'CANCELLING', pct: 0 };
+}
+
+function enqueue(id, feed) {
+  /*
+   * Consult jobState(), not the raw record: it is the file-aware view.
+   * Reading the record directly meant a stale READY record blocked
+   * re-queuing a deleted movie forever.
+   */
+  const st = jobState(id);
+  if (['QUEUED', 'DOWNLOADING', 'CONVERTING', 'READY'].includes(st.state)) {
+    // idempotent: clicking twice must not queue twice, and an existing
+    // file must never be re-encoded
+    return { id: id, state: st.state, pct: st.pct || 0 };
+  }
+  const meta = (feed.videos || []).find((v) => v.id === id) || {};
+  const job = {
+    id: id,
+    state: 'QUEUED',
+    pct: 0,
+    title: meta.title || '',
+    duration: meta.duration || 0,
+    error: null,
+    queued: Math.floor(Date.now() / 1000)
+  };
+  fs.mkdirSync(JOB_DIR, { recursive: true });
+  const tmp = jobPath(id) + '.part';
+  fs.writeFileSync(tmp, JSON.stringify(job, null, 1));
+  fs.renameSync(tmp, jobPath(id));
+  return job;
+}
+
+// --- page rendering -------------------------------------------------------
+
+const STYLE = [
+  'body { background: #c0c0c0; font-family: Verdana, Arial, sans-serif; font-size: 11px;',
+  '       color: #000000; margin: 8px; }',
+  'a { color: #000080; }',
+  'h1 { font-size: 16px; margin: 0px 0px 2px 0px; }',
+  '.bar { background: #000080; color: #ffffff; padding: 3px; font-size: 11px; }',
+  '.bar a { color: #ffff00; }',
+  '.warn { background: #ffff80; border: 2px solid #800000; padding: 5px; font-weight: bold; }',
+  '.cell { background: #d4d0c8; border: 2px outset #d4d0c8; }',
+  '.ttl { font-weight: bold; font-size: 12px; }',
+  '.meta { color: #404040; font-size: 12px; }',
+  // Fixed width + monospace so the progress bar has even cells and the
+  // button never resizes as its caption changes. A button that reflows on
+  // every poll makes the whole table jump.
+  '.b { width: 136px; font-family: "Courier New", Courier, monospace;',
+  '     font-size: 11px; }',
+  // `hand`, not `pointer`: IE5.0 does not understand `pointer`. Applied
+  // only once a file exists, so the cursor is the affordance telling you
+  // the thumbnail is clickable.
+  '.t { cursor: hand; }',
+  '.nav { padding: 4px; }'
+].join('\n');
+
+/*
+ * The server renders the correct initial button state, so a reload during a
+ * long download does not lose track of it. Anything still in flight is
+ * pushed into `pending` and the page resumes polling for it on load.
+ *
+ * No <form> is used for the JS path, but each control degrades: with
+ * scripting off the Download button is a real submit into /enqueue, which
+ * redirects back to the page.
+ */
+/*
+ * Fixed 17-character progress caption, e.g.  D[####------] 40%
+ * Same format the client builds, so the server-rendered initial state and
+ * the polled updates look identical and nothing shifts on first poll.
+ */
+function progressLabel(phase, pct) {
+  const p = pct || 0;
+  // Last cell is reserved for 100%: a full bar at 99% reads as finished
+  // when it is not. Anything above 0 gets at least one cell so the bar
+  // visibly moves straight away.
+  let n;
+  if (p >= 100) n = 10;
+  else if (p <= 0) n = 0;
+  else n = Math.max(1, Math.min(9, Math.floor(p / 10)));
+  let bar = '';
+  for (let i = 0; i < 10; i++) bar += i < n ? '#' : '-';
+  return phase + '[' + bar + ']' + String(p).padStart(3, ' ') + '%';
+}
+
+function buttons(id, pending, states) {
+  const st = jobState(id);
+  const j = esc(id);
+  let label = 'Download';
+  let disabled = '';
+
+  // Published to the client as ST0 so act() can decide what the button
+  // does from state, instead of the page rewriting onclick handlers.
+  states[id] = st.state;
+
+  if (st.state === 'READY') {
+    label = 'Play';
+  } else if (st.state === 'FAILED') {
+    label = 'Retry';
+  } else if (st.state === 'QUEUED') {
+    // In-progress buttons stay ENABLED so they can be used to stop the
+    // job; the caption still shows progress.
+    label = 'Queued...';
+    pending.push(id);
+  } else if (st.state === 'DOWNLOADING' || st.state === 'CONVERTING') {
+    label = progressLabel(st.state === 'DOWNLOADING' ? 'D' : 'C', st.pct);
+    pending.push(id);
+  } else if (st.state === 'CANCELLING') {
+    label = 'Stopping...';
+    pending.push(id);
+  }
+
+  const out = [];
+  out.push('<form method="post" action="/enqueue" style="display:inline; margin:0px" ' +
+           'onsubmit="return submitted(\'' + j + '\')">');
+  out.push('<input type="hidden" name="id" value="' + j + '">');
+  // One handler for every state, never reassigned at runtime.
+  out.push('<input type="submit" class="b" id="b_' + j + '" value="' +
+           esc(label) + '"' + disabled +
+           ' onclick="act(\'' + j + '\'); return false;">');
+  out.push('</form>');
+  if (st.state === 'FAILED' && st.error) {
+    out.push('<br><span class="meta">' + esc(clip(st.error, 60)) + '</span>');
+  }
+  return out.join('');
+}
+
+function renderPage(feed, page) {
+  const pending = [];
+  const states = {};
+  const videos = Array.isArray(feed.videos) ? feed.videos : [];
+  const pages = Math.max(1, Math.ceil(videos.length / PER_PAGE));
+  const p = Math.min(Math.max(1, page), pages);
+  const slice = videos.slice((p - 1) * PER_PAGE, p * PER_PAGE);
+
+  const h = [];
+  h.push('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">');
+  h.push('<html><head>');
+  h.push('<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">');
+  h.push('<title>YouTube 98</title>');
+  h.push('<style type="text/css">' + STYLE + '</style>');
+  h.push('</head><body>');
+
+  h.push('<h1>YouTube 98</h1>');
+  h.push('<div class="bar">Feed: <b>' + esc(feed.feed || '?') + '</b> &nbsp;|&nbsp; ' +
+         videos.length + ' videos &nbsp;|&nbsp; updated ' + esc(ago(feed.generated)) +
+         ' &nbsp;|&nbsp; page ' + p + ' of ' + pages + '</div>');
+
+  if (feed.public_mode) {
+    /*
+     * Deliberate public mode. Must not say "cookies are stale" — nothing
+     * is wrong and the mode was chosen, which is exactly what the earlier
+     * wording got wrong.
+     */
+    h.push('<p class="warn">' +
+      '<b>Public mode</b> &#8212; cookies.txt is being ignored on purpose, ' +
+      'including by the 30-minute timer.<br>' +
+      'Newest uploads from your subscribed channels via public RSS, ' +
+      'newest first. Expect heavy overlap with the personalised feed: ' +
+      'both draw on the same channels, so page 1 looks similar and the ' +
+      'differences are further in.<br>' +
+      'Press <b>Refresh feed</b> below to go back to the logged-in feed.' +
+      '</p>');
+  } else if (feed.fallback) {
+    // Unintended fallback: cookies really did fail.
+    h.push('<p class="warn">' +
+      'Cookies are stale &#8212; re-export cookies.txt from the tablet.<br>' +
+      'This is the <b>chronological fallback</b>: newest uploads from your ' +
+      'subscribed channels via public RSS, not your personalised feed. ' +
+      'Updated ' + esc(ago(feed.generated)) + '.<br>' +
+      esc(clip(feed.error || '', 160)) + '</p>');
+  } else if (feed.error || feed.stale_cookies) {
+    h.push('<p class="warn">' +
+      (feed.stale_cookies
+        ? 'Cookies are stale &#8212; re-export cookies.txt from the tablet. '
+        : 'Feed refresh failed. ') +
+      'Showing the last good list, last checked ' + esc(ago(feed.checked)) + '.<br>' +
+      esc(clip(feed.error || '', 160)) + '</p>');
+  }
+
+  if (!slice.length) {
+    h.push('<p class="warn">No videos in the feed. Run refresh-feed.py.</p>');
+  } else {
+    h.push(navBar(p, pages));
+    h.push('<table border="0" cellpadding="6" cellspacing="4" width="100%">');
+    for (let i = 0; i < slice.length; i += COLS) {
+      h.push('<tr>');
+      for (let c = 0; c < COLS; c++) {
+        const v = slice[i + c];
+        if (!v) { h.push('<td width="25%">&nbsp;</td>'); continue; }
+        // Rendered first because it fills states[v.id], which the
+        // thumbnail below needs — and it keeps this to one jobState()
+        // (one stat()) per video rather than two.
+        const bhtml = buttons(v.id, pending, states);
+        const isReady = states[v.id] === 'READY';
+        const j = esc(v.id);
+
+        h.push('<td width="25%" valign="top" class="cell">');
+        if (v.src) {
+          /*
+           * The thumbnail is the "copy path" control (the separate Path
+           * button is gone). copyPath() ignores anything not READY, so
+           * the only affordance needed is the cursor: `hand`, not
+           * `pointer` — IE5.0 does not know `pointer`. The class is
+           * swapped to "t" client-side the moment a job reaches READY.
+           */
+          h.push('<img id="i_' + j + '" src="' + esc(v.src) + '"' +
+                 ' width="160" height="90" border="0" alt=""' +
+                 (isReady ? ' class="t" title="Click to copy path"' : '') +
+                 ' onclick="copyPath(\'' + j + '\')"><br>');
+        } else {
+          h.push('<table border="0" width="160" height="90" bgcolor="#808080"><tr>' +
+                 '<td align="center"><font color="#ffffff">no image</font></td></tr></table>');
+        }
+        h.push('<span class="ttl">' + esc(clip(v.title, 70)) + '</span><br>');
+        h.push('<span class="meta">' + esc(clip(v.channel, 28)));
+        const d = hms(v.duration);
+        if (d) h.push(' &#183; ' + d);
+        // Publish age, when known. Makes a chronological list visibly
+        // chronological instead of looking like the personalised one.
+        if (v.published) h.push('<br>' + esc(ago(v.published)));
+        h.push('</span><br>');
+        h.push(bhtml);
+        h.push('</td>');
+      }
+      h.push('</tr>');
+    }
+    h.push('</table>');
+    h.push(navBar(p, pages));
+  }
+
+  h.push('<div class="bar">Files land in ' + esc(WIN_PATH) +
+         '&lt;id&gt;.mpg &#8212; <b>Play</b> needs the youtube98: handler: ' +
+         'copy ' + esc(WIN_PATH) + '_setup\\play.vbs to C:\\youtube98\\ ' +
+         'then run ' + esc(WIN_PATH) + '_setup\\youtube98.reg</div>');
+
+  // Plain forms, no scripting: these work regardless of the JScript state.
+  h.push('<div class="nav">');
+  h.push('<form method="post" action="/refresh" style="display:inline; margin:0px">' +
+         '<input type="submit" value="Refresh feed"></form>');
+  h.push(' <form method="post" action="/refresh" style="display:inline; margin:0px">' +
+         '<input type="hidden" name="nocookies" value="1">' +
+         '<input type="submit" value="Refresh without cookies.txt"></form>');
+  h.push(' <span class="meta">mode: <b>' +
+         (publicMode() ? 'public (cookies.txt ignored)' : 'logged in') +
+         '</b> &#183; or open <tt>/refresh?nocookies=1</tt></span>');
+  h.push('</div>');
+  h.push(clientScript(pending, states));
+  h.push('</body></html>');
+  return h.join('\n');
+}
+
+/*
+ * Client script, written for JScript 5.0 as shipped with IE5: no const/let,
+ * no arrow functions, no addEventListener, no JSON, no Array.forEach.
+ *
+ * Three IE5 specifics that matter:
+ *   - XMLHttpRequest does not exist; it is ActiveXObject("Microsoft.XMLHTTP")
+ *   - IE caches GETs aggressively, so every poll carries a cache-buster
+ *     on top of the server's no-cache header
+ *   - clipboardData.setData is available and is the only copy mechanism
+ *     here (execCommand('copy') arrived much later)
+ */
+function clientScript(pending, states) {
+  const winp = WIN_PATH.replace(/\\/g, '\\\\');
+  const ids = pending.map((i) => "'" + i + "'").join(',');
+  /*
+   * Only per-page values are inline; the logic is a separate cacheable
+   * file, which keeps each page down to ~9.7 KB across 11+ pages.
+   *
+   * ST0 carries the server-rendered state of every button on this page.
+   * boot() copies it into ST, so act() knows a "Play" button should play
+   * rather than re-queue — without the page ever rewriting a handler.
+   * Bracket assignment rather than an object literal: ids are already
+   * whitelisted to 11 safe characters, and this needs no quoting rules.
+   */
+  const st0 = Object.keys(states)
+    .map((k) => 'ST0["' + k + '"]="' + states[k] + '";')
+    .join('');
+  return '<script type="text/javascript">\n' +
+         'var WINP = "' + winp + '";\n' +
+         'var PENDING = [' + ids + '];\n' +
+         'var ST0 = {};' + st0 + '\n' +
+         '<\/script>\n' +
+         '<script type="text/javascript" src="/yt98.js"><\/script>';
+}
+
+const CLIENT_JS = [
+    /*
+     * IE5 crashed with an invalid page fault in JSCRIPT.DLL — a null
+     * dereference inside the script engine, not in MSXML. That is
+     * JScript 5.0's garbage-collector bug, and the old code fed it
+     * directly:
+     *
+     *   window.setTimeout(function () { poll(id); }, POLL)
+     *
+     * allocated a fresh closure on every poll, recursively, forever; and
+     * ready() assigned a closure to a DOM element's onclick, creating the
+     * DOM <-> closure cycle that is the other half of that bug.
+     *
+     * So: this file contains NO function expressions at all. Every
+     * function is named and global, every timer passes an existing
+     * function object, and no handler is ever reassigned. State lives in
+     * plain globals instead of being captured.
+     */
+    'var seq = 0;',
+    'var POLL = 2000;',
+    'var PEND = [];',
+    'var IDX = 0;',
+    'var REQ = null;',
+    'var TIMER = null;',
+    'var ST = {};',
+    // Last known percent per id, so an armed button can be restored to
+    // its progress caption without waiting for the next poll.
+    'var PCT = {};',
+    /*
+     * Stop confirmation without confirm().
+     *
+     * IE5's confirm() return value is not trustworthy, and this is the
+     * same JScript 5.0 that already crashed on closures — so no dialog is
+     * used at all. Clicking an in-progress button arms it ("STOP? click
+     * again", deliberately also 17 characters so the button does not
+     * resize), and a second click within ARM_MS actually cancels.
+     * Anything else disarms it.
+     *
+     * One armed button at a time, held in a global, so the disarm timer
+     * can be a plain named function with nothing captured.
+     */
+    'var ARMED = null;',
+    'var ARM_TIMER = null;',
+    'var ARM_MS = 4000;',
+
+    // ---- transport: one reused object, synchronous ------------------
+    'function getreq() {',
+    '  if (REQ != null) { return REQ; }',
+    '  try { REQ = new ActiveXObject("Microsoft.XMLHTTP"); }',
+    '  catch (e) {',
+    '    try { REQ = new XMLHttpRequest(); } catch (e2) { REQ = null; }',
+    '  }',
+    '  return REQ;',
+    '}',
+    'function httpSync(method, url, body) {',
+    '  var r = getreq();',
+    '  if (r == null) { return null; }',
+    '  try {',
+    '    r.open(method, url, false);',
+    '    if (method == "POST") {',
+    '      r.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");',
+    '    }',
+    '    r.send(method == "POST" ? body : null);',
+    '    if (r.status != 200) { return null; }',
+    '    return "" + r.responseText;',
+    '  } catch (e3) { return null; }',
+    '}',
+
+    // ---- dom helpers -----------------------------------------------
+    'function btn(id) { return document.getElementById("b_" + id); }',
+    'function thumb(id) { return document.getElementById("i_" + id); }',
+    'function label(id, text, enabled) {',
+    '  var b = btn(id);',
+    '  if (!b) { return; }',
+    '  b.value = text;',
+    '  b.disabled = !enabled;',
+    '}',
+
+    // Fixed 17 chars: D[####------] 40% — must match progressLabel()
+    // on the server so the caption does not jump on the first poll.
+    'function bar(phase, pct) {',
+    '  var n;',
+    '  if (isNaN(pct)) { pct = 0; }',
+    '  if (pct >= 100) { n = 10; }',
+    '  else if (pct <= 0) { n = 0; }',
+    '  else {',
+    '    n = Math.floor(pct / 10);',
+    '    if (n < 1) { n = 1; }',
+    '    if (n > 9) { n = 9; }',
+    '  }',
+    '  var s = "";',
+    '  for (var i = 0; i < 10; i++) { s = s + ((i < n) ? "#" : "-"); }',
+    '  var p = "" + pct;',
+    '  while (p.length < 3) { p = " " + p; }',
+    '  return phase + "[" + s + "]" + p + "%";',
+    '}',
+
+    // ---- actions ----------------------------------------------------
+    'function winPath(id) { return WINP + id + ".mpg"; }',
+    'function play(id) { window.location.href = "youtube98:" + winPath(id); }',
+    // clipboardData.setData returns a boolean and can also be refused
+    // outright by the IE security zone, so check both and always fall
+    // back to a prompt the path can be copied out of by hand.
+    // Bound to the thumbnail. Silently ignores anything not downloaded
+    // yet, so a stray click on a thumbnail never hands back a path to a
+    // file that does not exist.
+    'function copyPath(id) {',
+    '  if (ST[id] != "READY") { return; }',
+    '  var p = winPath(id);',
+    '  var ok = false;',
+    '  try {',
+    '    if (window.clipboardData && window.clipboardData.setData) {',
+    '      ok = window.clipboardData.setData("Text", p);',
+    '      if (ok !== false) { ok = true; }',
+    '    }',
+    '  } catch (e) { ok = false; }',
+    '  if (ok) { alert("Copied to clipboard:\\n" + p); }',
+    '  else { prompt("Copy this path (Ctrl+C):", p); }',
+    '}',
+
+    /*
+     * Single dispatcher. The inline onclick is always act('<id>') and is
+     * never rewritten, which is what keeps closures off DOM elements.
+     * What the button does is decided from ST, not from which handler
+     * happens to be attached.
+     */
+    'function busy(s) {',
+    '  return s == "QUEUED" || s == "DOWNLOADING" || s == "CONVERTING";',
+    '}',
+    'function restore(id) {',
+    '  var s = ST[id];',
+    '  if (s == "DOWNLOADING") { label(id, bar("D", PCT[id] || 0), true); }',
+    '  else if (s == "CONVERTING") { label(id, bar("C", PCT[id] || 0), true); }',
+    '  else if (s == "QUEUED") { label(id, "Queued...", true); }',
+    '}',
+    'function disarm() {',
+    '  ARM_TIMER = null;',
+    '  if (!ARMED) { return; }',
+    '  var id = ARMED;',
+    '  ARMED = null;',
+    '  restore(id);',
+    '}',
+    'function arm(id) {',
+    '  if (ARM_TIMER != null) { window.clearTimeout(ARM_TIMER); ARM_TIMER = null; }',
+    '  if (ARMED && ARMED != id) { var old = ARMED; ARMED = null; restore(old); }',
+    '  ARMED = id;',
+    '  label(id, "STOP? click again", true);',
+    '  ARM_TIMER = window.setTimeout(disarm, ARM_MS);',
+    '}',
+    'function stop(id) {',
+    '  if (ARM_TIMER != null) { window.clearTimeout(ARM_TIMER); ARM_TIMER = null; }',
+    '  ARMED = null;',
+    '  label(id, "Stopping...", false);',
+    '  var t = httpSync("POST", "/cancel?id=" + id + "&_=" + (seq++), "id=" + id);',
+    '  if (t == null) { restore(id); return; }',
+    '  absorb(id, t);',
+    '  schedule();',
+    '}',
+    'function act(id) {',
+    '  var s = ST[id];',
+    '  if (s == "READY") { play(id); return; }',
+    // In-progress: first click arms, second click within ARM_MS stops.
+    '  if (busy(s)) {',
+    '    if (ARMED == id) { stop(id); } else { arm(id); }',
+    '    return;',
+    '  }',
+    '  if (s == "CANCELLING") { return; }',
+    '  start(id);',
+    '}',
+    'function start(id) {',
+    '  label(id, "Starting...", false);',
+    '  ST[id] = "QUEUED";',
+    '  push(id);',
+    '  var t = httpSync("POST", "/enqueue?id=" + id + "&_=" + (seq++), "id=" + id);',
+    '  if (t == null) {',
+    '    ST[id] = "NONE";',
+    '    drop(id);',
+    '    label(id, "Error", true);',
+    '    return;',
+    '  }',
+    '  absorb(id, t);',
+    '  schedule();',
+    '}',
+
+    // ---- pending list (no shift/splice: JScript 5.0 era) ------------
+    'function push(id) {',
+    '  for (var i = 0; i < PEND.length; i++) { if (PEND[i] == id) { return; } }',
+    '  PEND[PEND.length] = id;',
+    '}',
+    'function drop(id) {',
+    '  var out = [];',
+    '  for (var i = 0; i < PEND.length; i++) {',
+    '    if (PEND[i] != id) { out[out.length] = PEND[i]; }',
+    '  }',
+    '  PEND = out;',
+    '  IDX = 0;',
+    '}',
+
+    // ---- status -----------------------------------------------------
+    'function absorb(id, text) {',
+    '  var parts = ("" + text).split(" ");',
+    '  var st = parts[0];',
+    '  var pct = parseInt(parts[1], 10);',
+    '  if (isNaN(pct)) { pct = 0; }',
+    '  ST[id] = st;',
+    '  PCT[id] = pct;',
+    '  if (st == "READY") {',
+    '    drop(id);',
+    '    if (ARMED == id) { ARMED = null; }',
+    '    label(id, "Play", true);',
+    // Give the thumbnail its hand cursor and tooltip now that there is
+    // a file to copy a path to. Property sets only, no closures.
+    '    var im = thumb(id);',
+    '    if (im) { im.className = "t"; im.title = "Click to copy path"; }',
+    '    return;',
+    '  }',
+    '  if (st == "FAILED") {',
+    '    drop(id);',
+    '    if (ARMED == id) { ARMED = null; }',
+    '    label(id, "Retry", true);',
+    '    return;',
+    '  }',
+    // Cancelled, or no record at all: back to a plain Download button.
+    '  if (st == "CANCELLED" || st == "NONE") {',
+    '    drop(id);',
+    '    if (ARMED == id) { ARMED = null; }',
+    '    ST[id] = "NONE";',
+    '    label(id, "Download", true);',
+    '    return;',
+    '  }',
+    '  if (st == "CANCELLING") { label(id, "Stopping...", false); return; }',
+    // An armed button keeps its "STOP? click again" caption. Progress is
+    // still recorded in PCT, so disarming restores the right number.
+    '  if (ARMED == id) { return; }',
+    // Enabled, not disabled: the button is also the stop control now.
+    '  if (st == "DOWNLOADING") { label(id, bar("D", pct), true); return; }',
+    '  if (st == "CONVERTING") { label(id, bar("C", pct), true); return; }',
+    '  label(id, "Queued...", true);',
+    '}',
+
+    /*
+     * The poll loop. One named function, rotated over PEND by index
+     * (no Array.shift, which is not dependable this far back), and
+     * setTimeout is handed the existing `tick` object — so not one
+     * closure is allocated no matter how long a job runs.
+     */
+    'function tick() {',
+    '  TIMER = null;',
+    '  if (PEND.length == 0) { return; }',
+    '  if (IDX >= PEND.length) { IDX = 0; }',
+    '  var id = PEND[IDX];',
+    '  IDX = IDX + 1;',
+    '  var t = httpSync("GET", "/status?id=" + id + "&_=" + (seq++), null);',
+    '  if (t != null) { absorb(id, t); }',
+    '  schedule();',
+    '}',
+    'function schedule() {',
+    '  if (TIMER != null) { return; }',
+    '  if (PEND.length == 0) { return; }',
+    '  TIMER = window.setTimeout(tick, POLL);',
+    '}',
+
+    // onsubmit guard: with scripting off this never runs and the form
+    // posts normally; with scripting on the inline onclick has already
+    // done the work.
+    'function submitted(id) { return false; }',
+
+    'function boot() {',
+    '  var k;',
+    '  for (k in ST0) { ST[k] = ST0[k]; }',
+    '  for (var i = 0; i < PENDING.length; i++) { push(PENDING[i]); }',
+    '  schedule();',
+    '}',
+    'window.onload = boot;'
+].join('\n');
+
+/*
+ * Windowed page list: first, last, and +/-2 around the current page, with
+ * ellipses for the gaps. A flat 1..N list was fine at 2 pages but becomes
+ * a wall of links at 13+, and horizontal space on an 800x600 screen is
+ * the scarce resource here.
+ */
+const NAV_WINDOW = 2;
+
+/*
+ * Response for /refresh. Carries a meta-refresh back to the feed so the
+ * flow is click -> wait -> land on the updated list, with no scripting
+ * involved at all.
+ */
+function refreshPage(result, nocookies) {
+  const h = [];
+  h.push('<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">');
+  h.push('<html><head>');
+  h.push('<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">');
+  if (result.started) h.push('<meta http-equiv="refresh" content="25;url=/">');
+  h.push('<title>YouTube 98 &#8212; refresh</title>');
+  h.push('<style type="text/css">' + STYLE + '</style>');
+  h.push('</head><body>');
+  h.push('<h1>Feed refresh</h1>');
+
+  if (result.started) {
+    h.push('<div class="bar">Started: <b>' + esc(result.mode) + '</b></div>');
+    if (nocookies) {
+      h.push('<p><b>Public mode is now on and stays on</b>, including for ' +
+             'the 30-minute timer, until you press <b>Refresh feed</b>. ' +
+             'The feed is built from public per-channel RSS. Your real ' +
+             '<tt>cookies.txt</tt> is untouched.</p>');
+      h.push('<p>Expect heavy overlap with the personalised feed &#8212; ' +
+             'measured 89 of 150 ids in common, because both draw on the ' +
+             'same subscribed channels. Page 1 looks similar; the ' +
+             'differences are deeper in the list.</p>');
+    } else {
+      h.push('<p>Public mode <b>off</b>: using <tt>cookies.txt</tt> as ' +
+             'normal. If it has expired this still falls back to public RSS ' +
+             'by itself.</p>');
+    }
+    h.push('<p>Takes roughly 10-45 seconds depending on how many new ' +
+           'thumbnails are needed. This page returns to the feed on its own ' +
+           'in 25 seconds.</p>');
+  } else {
+    h.push('<p class="warn">Not started: ' + esc(result.reason) + '</p>');
+  }
+
+  if (lastRefresh) {
+    h.push('<div class="bar">Previous run</div>');
+    h.push('<p class="meta">' + esc(lastRefresh.mode) + ' &#183; exit ' +
+           lastRefresh.code + ' &#183; ' + lastRefresh.seconds + 's<br>' +
+           esc(clip(lastRefresh.tail || '', 300)) + '</p>');
+  }
+
+  h.push('<p><a href="/">Back to the feed</a></p>');
+  h.push('</body></html>');
+  return h.join('\n');
+}
+
+function navBar(p, pages) {
+  if (pages < 2) return '';
+  const out = ['<div class="nav">'];
+  out.push(p > 1 ? '<a href="/?p=' + (p - 1) + '">[ &lt;&lt; Prev ]</a>' : '[ &lt;&lt; Prev ]');
+  out.push(' &nbsp;');
+
+  const show = new Set([1, pages]);
+  for (let i = p - NAV_WINDOW; i <= p + NAV_WINDOW; i++) {
+    if (i >= 1 && i <= pages) show.add(i);
+  }
+  const list = Array.from(show).sort((a, b) => a - b);
+
+  let prev = 0;
+  for (const i of list) {
+    if (prev && i > prev + 1) out.push(' ...');
+    out.push(i === p ? ' <b>[' + i + ']</b>' : ' <a href="/?p=' + i + '">' + i + '</a>');
+    prev = i;
+  }
+
+  out.push(' &nbsp;');
+  out.push(p < pages ? '<a href="/?p=' + (p + 1) + '">[ Next &gt;&gt; ]</a>' : '[ Next &gt;&gt; ]');
+  out.push('</div>');
+  return out.join('');
+}
+
+// --- http -----------------------------------------------------------------
+
+function send(res, code, type, body, cache) {
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(body, 'latin1');
+  // Explicit Content-Length and no compression: ancient clients handle
+  // chunked transfer and gzip poorly.
+  res.writeHead(code, {
+    'Content-Type': type,
+    'Content-Length': buf.length,
+    'Cache-Control': cache || 'no-cache',
+    'Connection': 'close'
+  });
+  res.end(buf);
+}
+
+const server = http.createServer((req, res) => {
+  /*
+   * Request log. Deliberately includes the User-Agent: when something
+   * misbehaves on the retro box the first question is always "did IE5
+   * actually fetch /yt98.js, and did it ever poll /status?", and
+   * guessing at that from the far end is hopeless.
+   */
+  const ua = (req.headers['user-agent'] || '-').slice(0, 60);
+  const peer = req.socket.remoteAddress || '-';
+  console.log([
+    new Date().toISOString().slice(11, 19),
+    peer,
+    req.method,
+    req.url,
+    '"' + ua + '"'
+  ].join(' '));
+
+  let url;
+  try {
+    url = new URL(req.url, 'http://localhost');
+  } catch (e) {
+    return send(res, 400, 'text/plain', 'bad request');
+  }
+  const pathname = decodeURIComponent(url.pathname);
+
+  if (pathname === '/' || pathname === '/index.html') {
+    const feed = readFeed();
+    const page = parseInt(url.searchParams.get('p') || '1', 10) || 1;
+    return send(res, 200, 'text/html', renderPage(feed, page));
+  }
+
+  if (pathname === '/refresh') {
+    /*
+     * GET is accepted as well as POST. Strictly this mutates, so POST
+     * alone would be tidier — but the whole point is being able to type
+     * the URL with its query parameter into IE5's address bar, and IE5
+     * cannot issue a POST that way. The page's own buttons use POST.
+     */
+    const fromQuery = String(url.searchParams.get('nocookies') || '');
+
+    // The page's own buttons are forms, so the flag arrives in the body
+    // rather than the query string. Accept it from either.
+    if (req.method === 'POST') {
+      let body = '';
+      req.on('data', (c) => { body += c; if (body.length > 1024) req.destroy(); });
+      req.on('end', () => {
+        const m = /(?:^|&)nocookies=([^&]*)/.exec(body);
+        const fromBody = m ? decodeURIComponent(m[1].replace(/\+/g, ' ')) : '';
+        const nc = truthy(fromQuery || fromBody);
+        const r = startRefresh(nc);
+        send(res, 200, 'text/html', refreshPage(r, nc));
+      });
+      return;
+    }
+
+    const nocookies = truthy(fromQuery);
+    const result = startRefresh(nocookies);
+    return send(res, 200, 'text/html', refreshPage(result, nocookies));
+  }
+
+  if (pathname === '/yt98.js') {
+    return send(res, 200, 'application/x-javascript', CLIENT_JS,
+                'max-age=86400');
+  }
+
+  if (pathname === '/enqueue' && req.method === 'POST') {
+    // Whitelist first, and spawn nothing here — the worker owns subprocesses.
+    const qid = url.searchParams.get('id');
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 2048) req.destroy(); });
+    req.on('end', () => {
+      const fid = /(?:^|&)id=([^&]*)/.exec(body);
+      const formId = fid ? decodeURIComponent(fid[1].replace(/\+/g, ' ')) : null;
+      const id = qid || formId;
+      if (!VIDEO_ID.test(id || '')) {
+        return send(res, 400, 'text/plain', 'FAILED bad id');
+      }
+      let job;
+      try {
+        job = enqueue(id, readFeed());
+      } catch (e) {
+        return send(res, 500, 'text/plain', 'FAILED ' + e.message);
+      }
+      // A query-string id means the AJAX path; a form body means scripting
+      // is off, so send the browser back to a page it can render.
+      if (!qid && formId) {
+        res.writeHead(302, { Location: '/', 'Content-Length': 0 });
+        return res.end();
+      }
+      return send(res, 200, 'text/plain', job.state + ' ' + (job.pct || 0));
+    });
+    return;
+  }
+
+  if (pathname === '/cancel' && req.method === 'POST') {
+    const id = url.searchParams.get('id');
+    if (!VIDEO_ID.test(id || '')) return send(res, 400, 'text/plain', 'FAILED bad id');
+    const st = requestCancel(id);
+    return send(res, 200, 'text/plain', st.state + ' ' + (st.pct || 0));
+  }
+
+  if (pathname === '/status') {
+    const id = url.searchParams.get('id');
+    if (!VIDEO_ID.test(id || '')) return send(res, 400, 'text/plain', 'FAILED bad id');
+    const st = jobState(id);
+    return send(res, 200, 'text/plain', st.state + ' ' + (st.pct || 0));
+  }
+
+  if (pathname.startsWith('/thumbs/')) {
+    // Same 11-char video-id whitelist used everywhere else; nothing else
+    // can be addressed, so there is no path to traverse out of THUMB_DIR.
+    const m = /^\/thumbs\/([A-Za-z0-9_-]{11})\.jpg$/.exec(pathname);
+    if (!m) return send(res, 404, 'text/plain', 'not found');
+    const file = path.join(THUMB_DIR, m[1] + '.jpg');
+    try {
+      const buf = fs.readFileSync(file);
+      return send(res, 200, 'image/jpeg', buf);
+    } catch (e) {
+      return send(res, 404, 'text/plain', 'not found');
+    }
+  }
+
+  return send(res, 404, 'text/plain', 'not found');
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log('[youtube98] listening on http://0.0.0.0:' + PORT + '/');
+  console.log('[youtube98] feed: ' + FEED_JSON);
+});

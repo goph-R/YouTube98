@@ -1,0 +1,259 @@
+# YouTube 98
+
+Browse your YouTube feed and watch videos on a **Windows 98 machine**, in
+**Internet Explorer 5**, over plain HTTP.
+
+A small server on a modern Linux box does everything the retro machine
+cannot: HTTPS, the modern YouTube page, and H.264/VP9 decoding. The Win98
+box only ever receives HTML 4.01 and pre-transcoded MPEG-1 files. Clicking
+**Download** queues a video; when it is ready, **Play** launches it in a
+local player.
+
+Developed against a Pentium II 350 MHz with 192 MB RAM and an ATi Radeon
+9200, running Win98SE and IE 5.0. MPEG-1 at 352x208 plays smoothly there.
+
+```
+  Win98SE box (IE5)                    server (Linux)
+  ---------------------                ----------------------------
+  feed page        <------ HTTP ------ node server.js  :8098
+  thumbnails                           yt-dlp   (feed + download)
+  XMLHTTP polling                      cookies.txt (exported by you)
+                                       ffmpeg   (transcode to MPEG-1)
+                                       worker   (serial job queue)
+  Z:\youtube98\  <--- SMB share -----  /media/archive/youtube98/
+  player via youtube98: protocol
+```
+
+The retro box never does TLS, never sees H.264, and never runs Python.
+
+---
+
+## Requirements
+
+**Server:** Linux, Node.js (no npm packages — stdlib only), Python 3,
+`ffmpeg`, and [`yt-dlp`](https://github.com/yt-dlp/yt-dlp). Use a current
+yt-dlp; distro packages are often too old to work against YouTube.
+
+**Retro client:** Windows 98/98SE with IE 5.0+, a media player that handles
+MPEG-1 (Media Player Classic, or the OS's own DirectShow decoder), and an
+SMB share mapped to the output directory.
+
+---
+
+## Install
+
+```sh
+git clone https://github.com/goph-R/YouTube98.git
+cd YouTube98
+
+# 1. Put a cookies.txt somewhere OUTSIDE this directory (see below)
+# 2. Build the feed
+./refresh-feed.py
+
+# 3. Run the server and the worker
+node server.js &
+node worker.js &
+```
+
+Then open `http://<server>:8098/` on the Win98 box.
+
+### Cookies
+
+The personalised feed requires a logged-in session. yt-dlp reads a
+Netscape-format `cookies.txt`.
+
+Exporting from an **Android tablet** works well, and keeps the login off
+both the server and the retro box:
+
+- Firefox for Android + the **YT-DLP Cookie Exporter** add-on exports the
+  right format directly.
+- Chrome on Android is a dead end — its cookie database is app-private and
+  unreadable without root.
+- **Do not log out of YouTube in that browser afterwards.** Logging out
+  invalidates the session server-side and kills the exported cookies.
+
+> **`cookies.txt` is a credential.** Anyone who can read it is logged into
+> your Google account. Keep it outside this repository, outside any web
+> root and outside any file share, `chmod 600`. It is in `.gitignore`, but
+> the safest place is somewhere this project cannot serve.
+
+Note that automated downloading with account cookies is against YouTube's
+Terms of Service. How you run this is your call.
+
+### Playback handler (optional but recommended)
+
+To make **Play** launch a local player, register the `youtube98:` protocol
+on the Win98 machine:
+
+```
+md C:\youtube98
+copy <share>\youtube98\_setup\play.vbs C:\youtube98\
+```
+
+Then run `setup/youtube98.reg` (copy it to the Win98 box first).
+
+Windows hands a protocol handler the **entire URL** as `%1`, e.g.
+`youtube98:Z:\youtube98\abc12345678.mpg` — which no media player can open.
+`play.vbs` strips the scheme and launches the player with the bare path. It
+searches common Media Player Classic locations and otherwise falls back to
+the shell's `.mpg` association.
+
+The `.reg` file uses the `REGEDIT4` header on purpose: the
+`Windows Registry Editor Version 5.00` format is Windows 2000+ and Win98's
+`regedit` refuses it.
+
+Without the handler, clicking a **thumbnail** copies the file's Windows
+path to the clipboard instead.
+
+### Running under systemd (no root needed)
+
+User units work well. Example:
+
+```ini
+# ~/.config/systemd/user/youtube98-server.service
+[Service]
+WorkingDirectory=/path/to/YouTube98
+ExecStart=/usr/bin/node /path/to/YouTube98/server.js
+Restart=always
+[Install]
+WantedBy=default.target
+```
+
+Do the same for `worker.js`, plus a `oneshot` service and timer for
+`refresh-feed.py` (every 30 minutes suits it). Run
+`loginctl enable-linger $USER` so the units survive logout. If Node came
+from nvm, `ExecStart` must be the absolute versioned path — systemd gets no
+shell, so nvm's shell function is unavailable.
+
+---
+
+## Configuration
+
+All via environment variables; the defaults reflect the author's setup.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `YT98_PORT` | `8098` | server port |
+| `YT98_COOKIES` | `~/cookies.txt` | Netscape cookie jar |
+| `YT98_OUT` | `/media/archive/youtube98` | where finished `.mpg` files go (export this over SMB) |
+| `YT98_WIN_PATH` | `Z:\youtube98\` | the same directory as the Win98 box sees it |
+| `YT98_FEED` | `:ytrec` | feed source (see below) |
+| `YT98_LIMIT` | `150` | how many entries to ingest |
+| `YT98_YTDLP` | `~/.local/bin/yt-dlp` | yt-dlp binary |
+| `YT98_KEEP_GB` | `20` | retention size cap |
+| `YT98_KEEP_DAYS` | `0` | optional age cap, 0 = off |
+| `YT98_THUMB_WORKERS` | `6` | parallel thumbnail fetches |
+
+### Feed sources
+
+yt-dlp exposes the account's own feeds. All need cookies:
+
+| `YT98_FEED` | Feed |
+|---|---|
+| `:ytrec` | Recommended — the personalised home feed |
+| `:ytsubs` | Subscriptions, in YouTube's order |
+| `:ytwatchlater` | Watch Later |
+| `:ytfav`, `:ythistory` | Favourites, watch history |
+
+`:ytwatchlater` suits this workflow nicely: queue things on a phone, and
+they appear on the retro box as a deliberate list.
+
+---
+
+## Using it
+
+- **Download** — queues the video. The button caption becomes a progress
+  bar, `D[####------] 40%` while downloading and `C[...]` while
+  transcoding.
+- **Stopping a job** — click an in-progress button once; it arms, showing
+  `STOP? click again`. Click again within 4 seconds to cancel. (No
+  `confirm()` dialog: IE5's return value is not dependable.) The partial
+  download is discarded and the button returns to **Download**.
+- **Play** — launches the local player via the `youtube98:` handler. It
+  runs as a separate process, so you can keep browsing and paginating
+  while the video plays.
+- **Click a thumbnail** — copies the Windows path to the clipboard (only
+  once the file exists).
+- **Refresh feed** / **Refresh without cookies.txt** — rebuild the feed on
+  demand. Also reachable as `/refresh` and `/refresh?nocookies=1`.
+- **Deleting a `.mpg`** is supported: the file on disk is the source of
+  truth, so the button reverts to **Download** on its own.
+
+### Public mode
+
+`/refresh?nocookies=1` turns on a **sticky** public mode: `cookies.txt` is
+ignored, including by the scheduled refresh, and the feed is rebuilt from
+public per-channel RSS. **Refresh feed** turns it back off.
+
+This is also the automatic fallback when cookies expire, so the feed keeps
+updating instead of freezing. The channel list is harvested from `:ytsubs`
+whenever a logged-in refresh succeeds, so no manual export is needed.
+
+Expect heavy overlap with the personalised feed — both draw on the same
+subscribed channels, so public mode changes the *ranking* (newest first,
+no algorithm), not the creators.
+
+---
+
+## Notes from building it
+
+Things that cost real debugging time, in case they save you some:
+
+- **IE5 has no `XMLHttpRequest`.** It is
+  `new ActiveXObject("Microsoft.XMLHTTP")`, used synchronously here.
+- **JScript 5.0 crashes on closures.** An async callback plus a
+  `setTimeout(function(){...})` per poll caused an invalid page fault in
+  `JSCRIPT.DLL` — its garbage collector, not the HTTP object. The client
+  script therefore contains **no function expressions at all**: every
+  function is named and global, timers are handed existing function
+  objects, and no handler is ever reassigned to a DOM element.
+- **Text is emitted as pure ASCII.** Non-ASCII becomes numeric character
+  references, and characters Win98 cannot draw (emoji, dingbats) are
+  stripped. Charset negotiation then stops mattering, and accented
+  characters still render.
+- **MPEG-1 codes in 16x16 macroblocks.** A height of 198 is coded as 208,
+  and Win98's DirectShow decoder does not reliably crop the surplus rows —
+  which show up as a green band, because the padding carries zeroed
+  chroma. Output is therefore padded to a multiple of 16 with real black.
+- **Cookies break downloads.** Authenticated requests get routed to player
+  clients that fail with *"The page needs to be reloaded"*, while the same
+  video downloads fine anonymously. So downloads are tried **anonymously
+  first**, with cookies only as a fallback for age-restricted material.
+  The *feed* still requires them.
+- **Explicit `Content-Length`, `Connection: close`, no gzip.** Ancient
+  clients handle chunked transfer and compression badly.
+- Source is capped at 480p and h264 is preferred: the output is 352px wide,
+  so anything larger is downloaded and decoded for nothing.
+
+---
+
+## Security
+
+This has **no authentication whatsoever** and is designed for a trusted
+LAN. `/enqueue`, `/cancel` and `/refresh` are reachable by anything that
+can reach the port, and `/refresh` accepts `GET` (deliberately, so the URL
+can be typed into IE5's address bar). **Do not expose it to the internet.**
+
+Video ids are whitelisted to `^[A-Za-z0-9_-]{11}$` at every entry point and
+all subprocesses are spawned with argument arrays, never a shell string.
+
+---
+
+## Limitations
+
+- One encode at a time, by design.
+- No search, no comments, no subscribing — it is a feed reader and
+  downloader.
+- Thumbnails accumulate in `thumbs/` and are never pruned.
+- Public RSS carries no duration, so the worker probes the downloaded file
+  instead.
+- The author's older files predate the macroblock fix; re-download to
+  clear the green band.
+
+## License
+
+[MIT](LICENSE).
+
+Note that the MIT licence covers *this code only*. It says nothing about
+YouTube's Terms of Service, which you are responsible for, and nothing
+about the content you download.

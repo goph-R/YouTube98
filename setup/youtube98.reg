@@ -1,0 +1,25 @@
+REGEDIT4
+
+; youtube98 - register the "youtube98:" URL protocol on Win98SE
+;
+; REGEDIT4 header on purpose: the "Windows Registry Editor Version 5.00"
+; format is Win2000+ and Win98's regedit will refuse it.
+;
+; Expects the shim at C:\youtube98\play.vbs
+;   1. md C:\youtube98
+;   2. copy Z:\youtube98\_setup\play.vbs C:\youtube98\
+;   3. double-click this file, confirm, then restart IE
+;
+; Test from Start > Run:
+;   wscript "C:\youtube98\play.vbs" "youtube98:Z:\youtube98\SOMEID.mpg"
+
+[HKEY_CLASSES_ROOT\youtube98]
+@="URL:youtube98 Protocol"
+"URL Protocol"=""
+
+[HKEY_CLASSES_ROOT\youtube98\shell]
+
+[HKEY_CLASSES_ROOT\youtube98\shell\open]
+
+[HKEY_CLASSES_ROOT\youtube98\shell\open\command]
+@="wscript.exe \"C:\\youtube98\\play.vbs\" \"%1\""
