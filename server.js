@@ -340,10 +340,12 @@ const STYLE = [
   // every poll makes the whole table jump.
   '.b { width: 136px; font-family: "Courier New", Courier, monospace;',
   '     font-size: 11px; }',
-  // `hand`, not `pointer`: IE5.0 does not understand `pointer`. Applied
-  // only once a file exists, so the cursor is the affordance telling you
-  // the thumbnail is clickable.
-  '.t { cursor: hand; }',
+  /*
+   * Both spellings, in this order. Modern browsers take `pointer` and
+   * discard `hand` as invalid; IE5 discards `pointer` as unknown and
+   * takes `hand`. Last valid declaration wins in each.
+   */
+  '.t { cursor: pointer; cursor: hand; }',
   '.nav { padding: 4px; }'
 ].join('\n');
 
@@ -537,6 +539,14 @@ function renderPage(feed, page) {
          (publicMode() ? 'public (cookies.txt ignored)' : 'logged in') +
          '</b> &#183; or open <tt>/refresh?nocookies=1</tt></span>');
   h.push('</div>');
+  /*
+   * Off-screen input used by the execCommand("copy") path above. Needed
+   * when the page is reached over plain http by IP, where
+   * navigator.clipboard does not exist. Positioned rather than
+   * display:none, because a hidden input cannot be selected.
+   */
+  h.push('<div style="position:absolute; left:-999px; top:-999px">' +
+         '<input type="text" id="cb" value="" size="10"></div>');
   h.push(clientScript(pending, states));
   h.push('</body></html>');
   return h.join('\n');
@@ -683,6 +693,21 @@ const CLIENT_JS = [
     // Bound to the thumbnail. Silently ignores anything not downloaded
     // yet, so a stray click on a thumbnail never hands back a path to a
     // file that does not exist.
+    /*
+     * Four ways to put a path on the clipboard, because the two target
+     * browsers share none of them:
+     *
+     *  1. IE5          window.clipboardData.setData
+     *  2. modern+https navigator.clipboard (secure contexts only, which
+     *                  includes http://localhost)
+     *  3. modern+http  select a hidden input + execCommand("copy"), for
+     *                  when the page is reached by LAN IP and is
+     *                  therefore not a secure context
+     *  4. anything     prompt(), copyable by hand
+     *
+     * No .then() on the clipboard promise: attaching one would mean a
+     * function expression, which is what crashes JScript 5.0.
+     */
     'function copyPath(id) {',
     '  if (ST[id] != "READY") { return; }',
     '  var p = winPath(id);',
@@ -693,6 +718,24 @@ const CLIENT_JS = [
     '      if (ok !== false) { ok = true; }',
     '    }',
     '  } catch (e) { ok = false; }',
+    '  if (!ok) {',
+    '    try {',
+    '      if (navigator.clipboard && navigator.clipboard.writeText) {',
+    '        navigator.clipboard.writeText(p);',
+    '        ok = true;',
+    '      }',
+    '    } catch (e2) { ok = false; }',
+    '  }',
+    '  if (!ok) {',
+    '    try {',
+    '      var box = document.getElementById("cb");',
+    '      if (box && document.execCommand) {',
+    '        box.value = p;',
+    '        box.select();',
+    '        ok = document.execCommand("copy");',
+    '      }',
+    '    } catch (e3) { ok = false; }',
+    '  }',
     '  if (ok) { alert("Copied to clipboard:\\n" + p); }',
     '  else { prompt("Copy this path (Ctrl+C):", p); }',
     '}',

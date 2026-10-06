@@ -97,6 +97,39 @@ settings afterwards.
   `TerminateProcess`, so ffmpeg dies abruptly instead of cleanly — which
   is harmless here, since a cancelled job's partial output is discarded.
 
+### Single-machine demo (no retro box)
+
+Everything on one Windows 10/11 machine, viewed in a modern browser — no
+SMB share, no protocol handler, no second computer:
+
+```powershell
+.\install.ps1 -InstallDeps
+python refresh-feed.py
+node server.js      # in one terminal
+node worker.js      # in another
+```
+
+Then open **`http://localhost:8098/`** and use it as-is. The page is
+HTML 4.01 built for IE5, so it looks like 1999, but everything works:
+browsing, Download with its progress bar, STOP, public mode, retention.
+The client script falls back from `ActiveXObject` to standard
+`XMLHttpRequest` by itself.
+
+Clicking a thumbnail copies the file's full local path, which is all you
+need without the `youtube98:` handler — `YT98_WIN_PATH` defaults to
+`YT98_OUT` on Windows, so the path is already right for this machine.
+
+> **Use `localhost`, not the machine's LAN IP.** `navigator.clipboard`
+> exists only in secure contexts, and `http://localhost` counts as one
+> while `http://192.168.x.x` does not. Over an IP the page falls back to
+> `execCommand("copy")` and then to `prompt()` — still usable, just less
+> smooth.
+
+Note the MPEG-1 352x208 output is sized for a Pentium II and will look
+soft on a modern display. That is rather the point of the project; if you
+want full-quality files on a one-machine setup, the transcode step is the
+thing to make optional.
+
 ### Manual start (any platform)
 
 ```sh
