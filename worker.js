@@ -5,8 +5,8 @@
  * Watches cache/jobs/ for QUEUED jobs and processes them one at a time:
  *
  *   yt-dlp  -> .tmp/<id>.<ext>      (best available source)
- *   ffmpeg  -> .tmp/<id>.mpg        (MPEG-1 for the PII 350)
- *   rename  -> /media/archive/youtube98/<id>.mpg
+ *   ffmpeg  -> .tmp/<id>.<ext>      (per YT98_PROFILE)
+ *   rename  -> $YT98_OUT/<id>.<ext>
  *
  * Serial on purpose: phobos is a 2c/4t Athlon and the encode is the only
  * real CPU work in this project. Jobs survive the browser closing, and
@@ -22,6 +22,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const retention = require('./retention');
+const PROF = require('./profiles');
 
 const BASE = __dirname;
 const JOB_DIR = path.join(BASE, 'cache', 'jobs');
@@ -55,30 +56,13 @@ const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
  * 350 MHz CPU for free.
  */
 /*
- * scale=352:-2 alone produced a green 4px band along the bottom on the
- * real hardware (reported 2026-10-05).
- *
- * Cause: MPEG-1 codes in 16x16 macroblocks. A 16:9 source scaled to
- * 352x198 has 198 % 16 == 6, so it is *coded* as 352x208 and the decoder
- * is expected to crop the 10 surplus rows back off. Win98's DirectShow
- * MPEG-1 decoder does not crop them reliably, and that padding carries
- * zeroed chroma (Y=0,Cb=0,Cr=0) — which renders as dark green.
- *
- * Verified the declared 198 rows were clean, so this was padding on
- * display, not bad source rows.
- *
- * Fix: pad the height up to the next multiple of 16 ourselves, with
- * intentional black, centred. The frame is then macroblock-aligned,
- * there are no surplus rows for a decoder to mishandle, and aspect is
- * preserved exactly (no 3% squash from rounding the scale instead).
- * 16:9 -> 352x208, 4:3 -> 352x272; width 352 is already 22 macroblocks.
+ * Encode settings come from profiles.js, selected with YT98_PROFILE.
+ * See that file for why dimensions are padded to multiples of 16 and why
+ * the Xvid profile sticks to Simple Profile.
  */
-const VF = 'scale=352:-2,fps=25,pad=352:ceil(ih/16)*16:0:(oh-ih)/2:black';
-const FFMPEG_ARGS = [
-  '-c:v', 'mpeg1video',
-  '-b:v', '1150k', '-maxrate', '1150k', '-bufsize', '320k',
-  '-c:a', 'mp2', '-ar', '44100', '-ac', '2', '-b:a', '192k'
-];
+const VF = PROF.vf;
+const FFMPEG_ARGS = PROF.args;
+const EXT = PROF.ext;
 
 // --- job store ------------------------------------------------------------
 
@@ -184,7 +168,7 @@ function run(cmd, args, onLine, job) {
 
 function findTmpSource(id) {
   const hit = fs.readdirSync(TMP_DIR).filter(
-    (f) => f.startsWith(id + '.') && !f.endsWith('.mpg') && !f.endsWith('.part')
+    (f) => f.startsWith(id + '.') && !f.endsWith(EXT) && !f.endsWith('.part')
   );
   return hit.length ? path.join(TMP_DIR, hit[0]) : null;
 }
@@ -296,7 +280,7 @@ async function transcode(job, src) {
     if (job.duration) log(job.id + ' probed duration ' + job.duration + 's');
   }
 
-  const tmpOut = path.join(TMP_DIR, job.id + '.mpg');
+  const tmpOut = path.join(TMP_DIR, job.id + EXT);
   const args = ['-y', '-loglevel', 'info', '-i', src, '-vf', VF]
     .concat(FFMPEG_ARGS, [tmpOut]);
 
@@ -319,7 +303,7 @@ async function transcode(job, src) {
 
   // Same filesystem, so this is atomic: the PII never sees a partial .mpg
   // appear on the share.
-  const finalOut = path.join(OUT_DIR, job.id + '.mpg');
+  const finalOut = path.join(OUT_DIR, job.id + EXT);
   fs.renameSync(tmpOut, finalOut);
   try { fs.unlinkSync(src); } catch (e) { /* best effort */ }
   return finalOut;
@@ -421,7 +405,7 @@ async function loop() {
         continue;
       }
       // If the output already exists, do not re-encode it.
-      const existing = path.join(OUT_DIR, job.id + '.mpg');
+      const existing = path.join(OUT_DIR, job.id + EXT);
       if (fs.existsSync(existing) && fs.statSync(existing).size > 0) {
         setState(job, 'READY', {
           pct: 100,
@@ -463,7 +447,7 @@ function main() {
   process.on('SIGTERM', release);
 
   log('watching ' + JOB_DIR);
-  log('output   ' + OUT_DIR + '/<id>.mpg');
+  log('output   ' + OUT_DIR + '/<id>' + EXT + '  [profile: ' + PROF.name + ']');
   loop();
 }
 

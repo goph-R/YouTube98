@@ -22,6 +22,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const PROF = require('./profiles');
 
 const BASE = __dirname;
 const OUT_DIR = process.env.YT98_OUT || path.join(os.homedir(), 'youtube98');
@@ -34,9 +35,15 @@ const KEEP_DAYS = parseInt(process.env.YT98_KEEP_DAYS || '0', 10);
 // Orphaned partial downloads in .tmp/ older than this are junk.
 const TMP_STALE_HOURS = 6;
 
-// Only ever consider files this project produced. Anything else in
-// OUT_DIR — notably _setup/ and .tmp/ — is not ours to delete.
-const MOVIE = /^([A-Za-z0-9_-]{11})\.mpg$/;
+/*
+ * Only ever consider files this project produced. Anything else in
+ * OUT_DIR — notably _setup/ and .tmp/ — is not ours to delete.
+ *
+ * Matches every profile's extension, not just the active one, so
+ * switching profiles does not leave old output unmanaged.
+ */
+const MOVIE = new RegExp('^([A-Za-z0-9_-]{11})(' +
+  PROF.knownExts.map((e) => e.replace('.', '\\.')).join('|') + ')$');
 
 function log(msg) {
   console.log('[retention] ' + msg);

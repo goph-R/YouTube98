@@ -212,12 +212,43 @@ write them out for you.
 | `YT98_OUT` | `~/youtube98` | where finished `.mpg` files go (share this over SMB) |
 | `YT98_WIN_PATH` | `Z:\youtube98\` (Windows: `YT98_OUT`) | the same directory as the Win98 box sees it |
 | `YT98_PYTHON` | `/usr/bin/python3` (Windows: `python`) | interpreter used by the refresh endpoint |
+| `YT98_PROFILE` | `mpeg1` | encode profile, `mpeg1` or `xvid480` (see below) |
 | `YT98_FEED` | `:ytrec` | feed source (see below) |
 | `YT98_LIMIT` | `150` | how many entries to ingest |
 | `YT98_YTDLP` | `~/.local/bin/yt-dlp` (Windows: `yt-dlp.exe` on PATH) | yt-dlp binary |
 | `YT98_KEEP_GB` | `20` | retention size cap |
 | `YT98_KEEP_DAYS` | `0` | optional age cap, 0 = off |
 | `YT98_THUMB_WORKERS` | `6` | parallel thumbnail fetches |
+
+### Encode profiles
+
+`node profiles.js` lists them and shows the exact filter chain.
+
+| `YT98_PROFILE` | Output | Needs |
+|---|---|---|
+| `mpeg1` (default) | MPEG-1 352px wide, 25fps, MP2, `.mpg` | nothing — Win98SE ships a DirectShow MPEG-1 decoder |
+| `xvid480` | Xvid Simple Profile 640px wide, 24fps, MP3, `.avi` | an Xvid/DivX codec or ffdshow on Win98 |
+
+`xvid480` is calibrated against a file a **Pentium II 350 with a Radeon
+9200 is known to play**: Xvid Simple Profile, 640x368, 23.976fps,
+1400 kbps. This profile targets the same shape and lands a little under
+it (~6 MB/min against that file's ~11 MB/min), so it should sit inside
+proven-playable territory.
+
+Deliberate choices in that profile:
+
+- **Simple Profile only** — no B-frames, no quarter-pixel, no GMC.
+  Advanced Simple Profile roughly doubles the decode cost and is what
+  makes "Xvid" files stutter on hardware this old.
+- **24fps cap.** Frame rate costs about as much as resolution on a CPU
+  this slow. A 30fps source gets frame-dropped, which judders slightly;
+  that trade is intentional.
+- Both output dimensions are padded to multiples of **16** so no
+  macroblock padding is left for the decoder to mishandle.
+
+**Switching profiles does not orphan existing files.** Anything looking
+for output accepts every known extension, and the page is told each
+video's real extension, so a library can hold both `.mpg` and `.avi`.
 
 ### Feed sources
 

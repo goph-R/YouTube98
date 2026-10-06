@@ -19,6 +19,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { spawn } = require('child_process');
+const PROF = require('./profiles');
 
 const BASE = __dirname;
 const PORT = parseInt(process.env.YT98_PORT || '8098', 10);
@@ -180,12 +181,21 @@ function readJob(id) {
  * after a worker restart, a cache wipe, or a manual drop into OUT_DIR.
  */
 function jobState(id) {
-  let haveFile = false;
-  try {
-    haveFile = fs.statSync(path.join(OUT_DIR, id + '.mpg')).size > 0;
-  } catch (e) { /* not downloaded yet, or deleted */ }
-
-  if (haveFile) return { state: 'READY', pct: 100, file: id + '.mpg' };
+  /*
+   * Accept output from ANY profile, not just the active one. Switching
+   * YT98_PROFILE would otherwise make every previously downloaded file
+   * look as though it had never been fetched. The active profile's
+   * extension is tried first so a re-encode is preferred when both
+   * exist.
+   */
+  const exts = [PROF.ext].concat(PROF.knownExts.filter((e) => e !== PROF.ext));
+  for (const ext of exts) {
+    try {
+      if (fs.statSync(path.join(OUT_DIR, id + ext)).size > 0) {
+        return { state: 'READY', pct: 100, file: id + ext, ext: ext };
+      }
+    } catch (e) { /* try the next extension */ }
+  }
 
   const job = readJob(id);
   if (!job) return { state: 'NONE', pct: 0 };
@@ -377,7 +387,7 @@ function progressLabel(phase, pct) {
   return phase + '[' + bar + ']' + String(p).padStart(3, ' ') + '%';
 }
 
-function buttons(id, pending, states) {
+function buttons(id, pending, states, exts) {
   const st = jobState(id);
   const j = esc(id);
   let label = 'Download';
@@ -386,6 +396,7 @@ function buttons(id, pending, states) {
   // Published to the client as ST0 so act() can decide what the button
   // does from state, instead of the page rewriting onclick handlers.
   states[id] = st.state;
+  if (st.ext) exts[id] = st.ext;
 
   if (st.state === 'READY') {
     label = 'Play';
@@ -422,6 +433,7 @@ function buttons(id, pending, states) {
 function renderPage(feed, page) {
   const pending = [];
   const states = {};
+  const exts = {};
   const videos = Array.isArray(feed.videos) ? feed.videos : [];
   const pages = Math.max(1, Math.ceil(videos.length / PER_PAGE));
   const p = Math.min(Math.max(1, page), pages);
@@ -485,7 +497,7 @@ function renderPage(feed, page) {
         // Rendered first because it fills states[v.id], which the
         // thumbnail below needs — and it keeps this to one jobState()
         // (one stat()) per video rather than two.
-        const bhtml = buttons(v.id, pending, states);
+        const bhtml = buttons(v.id, pending, states, exts);
         const isReady = states[v.id] === 'READY';
         const j = esc(v.id);
 
@@ -524,7 +536,7 @@ function renderPage(feed, page) {
   }
 
   h.push('<div class="bar">Files land in ' + esc(WIN_PATH) +
-         '&lt;id&gt;.mpg &#8212; <b>Play</b> needs the youtube98: handler: ' +
+         '&lt;id&gt;' + esc(PROF.ext) + ' &#8212; <b>Play</b> needs the youtube98: handler: ' +
          'copy ' + esc(WIN_PATH) + '_setup\\play.vbs to C:\\youtube98\\ ' +
          'then run ' + esc(WIN_PATH) + '_setup\\youtube98.reg</div>');
 
@@ -547,7 +559,7 @@ function renderPage(feed, page) {
    */
   h.push('<div style="position:absolute; left:-999px; top:-999px">' +
          '<input type="text" id="cb" value="" size="10"></div>');
-  h.push(clientScript(pending, states));
+  h.push(clientScript(pending, states, exts));
   h.push('</body></html>');
   return h.join('\n');
 }
@@ -563,7 +575,7 @@ function renderPage(feed, page) {
  *   - clipboardData.setData is available and is the only copy mechanism
  *     here (execCommand('copy') arrived much later)
  */
-function clientScript(pending, states) {
+function clientScript(pending, states, exts) {
   const winp = WIN_PATH.replace(/\\/g, '\\\\');
   const ids = pending.map((i) => "'" + i + "'").join(',');
   /*
@@ -579,10 +591,15 @@ function clientScript(pending, states) {
   const st0 = Object.keys(states)
     .map((k) => 'ST0["' + k + '"]="' + states[k] + '";')
     .join('');
+  const ext0 = Object.keys(exts)
+    .map((k) => 'EXT0["' + k + '"]="' + exts[k] + '";')
+    .join('');
   return '<script type="text/javascript">\n' +
          'var WINP = "' + winp + '";\n' +
+         'var EXT = "' + PROF.ext + '";\n' +
          'var PENDING = [' + ids + '];\n' +
          'var ST0 = {};' + st0 + '\n' +
+         'var EXT0 = {};' + ext0 + '\n' +
          '<\/script>\n' +
          '<script type="text/javascript" src="/yt98.js"><\/script>';
 }
@@ -685,7 +702,9 @@ const CLIENT_JS = [
     '}',
 
     // ---- actions ----------------------------------------------------
-    'function winPath(id) { return WINP + id + ".mpg"; }',
+    // Extension per video, because a page can legitimately mix output
+    // from two profiles; EXT is the active profile's default.
+    'function winPath(id) { return WINP + id + (EXT0[id] || EXT); }',
     'function play(id) { window.location.href = "youtube98:" + winPath(id); }',
     // clipboardData.setData returns a boolean and can also be refused
     // outright by the IE security zone, so check both and always fall
