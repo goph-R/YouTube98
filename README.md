@@ -233,6 +233,7 @@ write them out for you.
 | `YT98_THUMB_WORKERS` | `6` | parallel thumbnail fetches |
 | `YT98_THUMB_W`, `YT98_THUMB_H` | `320`, `180` | stored thumbnail size |
 | `YT98_THUMB_Q` | `4` | thumbnail JPEG quality, 2 (best) to 31 |
+| `YT98_COLS` | `4` | grid columns |
 
 ### Encode profiles
 

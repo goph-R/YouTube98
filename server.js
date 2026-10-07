@@ -30,7 +30,7 @@ const JOB_DIR = path.join(BASE, 'cache', 'jobs');
 // is the folder you share over SMB for the retro box to map.
 const OUT_DIR = process.env.YT98_OUT || path.join(os.homedir(), 'youtube98');
 const PER_PAGE = 12; // 4 across x 3 down — fits 800x600 without scrolling much
-const COLS = 4;
+const COLS = Math.max(1, parseInt(process.env.YT98_COLS || '4', 10));
 
 /*
  * The output directory as the *Win98 box* sees it, used for the
@@ -43,6 +43,9 @@ const COLS = 4;
  */
 const WIN_PATH = process.env.YT98_WIN_PATH ||
   (process.platform === 'win32' ? OUT_DIR + '\\' : 'Z:\\youtube98\\');
+
+// Column width as a percentage, so the grid still adds up when COLS changes.
+const CELL_PCT = Math.floor(100 / COLS) + '%';
 
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 
@@ -379,7 +382,17 @@ const STYLE = [
   // "STOP?") do not resize it either.
   '.a { width: 58px; font-family: "Courier New", Courier, monospace;',
   '     font-size: 11px; margin-top: 2px; }',
-  '.nav { padding: 4px; }'
+  '.nav { padding: 4px; }',
+  /*
+   * table-layout: fixed is what makes `width="100%"` on the thumbnails
+   * work at all. With the default auto layout a cell's width depends on
+   * its content, so a percentage inside it is circular and IE5 falls
+   * back to the image's intrinsic size — which then overflowed the
+   * window and produced a horizontal scrollbar. Fixed layout takes the
+   * column widths from the first row instead, so the cell width is known
+   * before the images are measured.
+   */
+  '.grid { table-layout: fixed; width: 100%; }'
 ].join('\n');
 
 /*
@@ -538,12 +551,12 @@ function renderPage(feed, page) {
     h.push('<p class="warn">No videos in the feed. Run refresh-feed.py.</p>');
   } else {
     h.push(navBar(p, pages));
-    h.push('<table border="0" cellpadding="6" cellspacing="4" width="100%">');
+    h.push('<table class="grid" border="0" cellpadding="6" cellspacing="4" width="100%">');
     for (let i = 0; i < slice.length; i += COLS) {
       h.push('<tr>');
       for (let c = 0; c < COLS; c++) {
         const v = slice[i + c];
-        if (!v) { h.push('<td width="25%">&nbsp;</td>'); continue; }
+        if (!v) { h.push('<td width="' + CELL_PCT + '">&nbsp;</td>'); continue; }
         // Rendered first because it fills states[v.id], which the
         // thumbnail below needs — and it keeps this to one jobState()
         // (one stat()) per video rather than two.
@@ -551,7 +564,7 @@ function renderPage(feed, page) {
         const isReady = states[v.id] === 'READY';
         const j = esc(v.id);
 
-        h.push('<td width="25%" valign="top" class="cell">');
+        h.push('<td width="' + CELL_PCT + '" valign="top" class="cell">');
         if (v.src) {
           /*
            * The thumbnail is the "copy path" control (the separate Path
