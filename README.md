@@ -177,9 +177,17 @@ Then run `setup/youtube98.reg` (copy it to the Win98 box first).
 
 Windows hands a protocol handler the **entire URL** as `%1`, e.g.
 `youtube98:Z:\youtube98\abc12345678.mpg` — which no media player can open.
-`play.vbs` strips the scheme and launches the player with the bare path. It
-searches common Media Player Classic locations and otherwise falls back to
-the shell's `.mpg` association.
+`play.vbs` strips the scheme and launches the player with the bare path.
+
+**It picks the player from the file extension:** audio (`.mp3`, `.ogg`,
+`.wav`, `.wma`, `.m3u`) goes to **Winamp**, anything else to **Media
+Player Classic**. Each has a list of the usual install locations, and
+both fall back to the shell association — so it works before either is
+installed.
+
+Set `WINAMP_ENQUEUE = True` at the top of `play.vbs` to enqueue audio
+(`/ADD`) instead of replacing the playlist, which is nicer for queueing
+several MP3s from the feed in one pass.
 
 The `.reg` file uses the `REGEDIT4` header on purpose: the
 `Windows Registry Editor Version 5.00` format is Windows 2000+ and Win98's
@@ -330,8 +338,8 @@ they appear on the retro box as a deliberate list.
   Independent of the video job: a video can have both, or just one. No
   video stream is fetched at all, so it is a fraction of the bytes
   (~5 MB against ~30 MB) and much quicker. Captions are abbreviated to
-  fit: `MP3` → `D40%` → `C40%` → `OK`, or `Err`. Clicking `OK` copies the
-  `.mp3` path.
+  fit: `MP3` → `D40%` → `C40%` → `Play`, or `Err`. **`Play` opens it in
+  Winamp** via the same `youtube98:` handler.
 - **Stopping a job** — click an in-progress button once; it arms, showing
   `STOP? click again`. Click again within 4 seconds to cancel. (No
   `confirm()` dialog: IE5's return value is not dependable.) The partial

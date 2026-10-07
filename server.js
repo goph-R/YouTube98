@@ -416,7 +416,7 @@ function progressLabel(phase, pct) {
  * and only the phase letter and percentage survive.
  */
 function audioLabel(st) {
-  if (st.state === 'READY') return 'OK';
+  if (st.state === 'READY') return 'Play';
   if (st.state === 'FAILED') return 'Err';
   if (st.state === 'QUEUED') return '...';
   if (st.state === 'CANCELLING') return 'stop';
@@ -747,14 +747,18 @@ const CLIENT_JS = [
     '  return isAudio(k) ? shortCap(phase, pct) : bar(phase, pct);',
     '}',
     'function idleCap(k) { return isAudio(k) ? "MP3" : "Download"; }',
-    'function doneCap(k) { return isAudio(k) ? "OK" : "Play"; }',
+    'function doneCap(k) { return "Play"; }',
     'function failCap(k) { return isAudio(k) ? "Err" : "Retry"; }',
     'function armCap(k) { return isAudio(k) ? "STOP?" : "STOP? click again"; }',
 
     // ---- paths ------------------------------------------------------
     'function winPath(id) { return WINP + id + (EXT0[id] || EXT); }',
     'function audioPath(id) { return WINP + id + AEXT; }',
-    'function play(id) { window.location.href = "youtube98:" + winPath(id); }',
+    // One launcher for both kinds. play.vbs picks the player from the
+    // file extension: Winamp for audio, MPC for video.
+    'function openIn(p) { window.location.href = "youtube98:" + p; }',
+    'function play(id) { openIn(winPath(id)); }',
+    'function playA(id) { openIn(audioPath(id)); }',
     /*
      * Four clipboard routes, because the two target browsers share none:
      * IE5's clipboardData, modern navigator.clipboard (secure contexts
@@ -840,7 +844,7 @@ const CLIENT_JS = [
     'function core(k) {',
     '  var s = ST[k];',
     '  if (s == "READY") {',
-    '    if (isAudio(k)) { putClip(audioPath(idOf(k))); } else { play(idOf(k)); }',
+    '    if (isAudio(k)) { playA(idOf(k)); } else { play(idOf(k)); }',
     '    return;',
     '  }',
     '  if (busy(s)) {',

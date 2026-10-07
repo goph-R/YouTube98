@@ -8,12 +8,21 @@ Option Explicit
 ' Why this exists: Windows passes a protocol handler the WHOLE url as %1,
 ' e.g.  youtube98:Z:\youtube98\abc12345678.mpg
 ' No media player can open that, so this strips the scheme and launches
-' the player with the bare path.
+' the right player with the bare path.
+'
+' Player choice follows the file extension: audio goes to Winamp, video
+' to Media Player Classic. Both fall back to the shell association, so
+' this still works before either is installed.
 '
 ' Install:  copy this file to C:\youtube98\play.vbs, then run youtube98.reg
 '=====================================================================
 
-Dim raw, p, sh, fso, i, candidates, player
+' Set to True to ENQUEUE audio in Winamp (/ADD) instead of replacing the
+' playlist and playing immediately. Handy for queueing several MP3s from
+' the feed in one pass.
+Const WINAMP_ENQUEUE = False
+
+Dim raw, p, ext, sh, fso, i, candidates, player, args
 
 If WScript.Arguments.Count = 0 Then
   MsgBox "No URL supplied.", 16, "youtube98"
@@ -51,16 +60,31 @@ If Not fso.FileExists(p) Then
   WScript.Quit 1
 End If
 
-' --- find a player ---------------------------------------------------
-' Prefer Media Player Classic wherever it happens to live; otherwise hand
-' the file to whatever .mpg is associated with.
-candidates = Array( _
-  "C:\Program Files\Media Player Classic\mplayerc.exe", _
-  "C:\Program Files\Media Player Classic\mpc-hc.exe", _
-  "C:\Program Files\MPC\mplayerc.exe", _
-  "C:\Program Files\K-Lite Codec Pack\Media Player Classic\mplayerc.exe", _
-  "C:\MPC\mplayerc.exe", _
-  "C:\mplayerc.exe")
+ext = LCase(fso.GetExtensionName(p))
+
+' --- pick a player for this kind of file ----------------------------
+args = ""
+
+If ext = "mp3" Or ext = "ogg" Or ext = "wav" Or ext = "wma" Or ext = "m3u" Then
+  ' Audio: Winamp. The default install path first, then the usual
+  ' alternatives.
+  candidates = Array( _
+    "C:\Program Files\Winamp\winamp.exe", _
+    "C:\Program Files\Winamp3\winamp3.exe", _
+    "C:\Program Files (x86)\Winamp\winamp.exe", _
+    "C:\Winamp\winamp.exe", _
+    "D:\Program Files\Winamp\winamp.exe")
+  If WINAMP_ENQUEUE Then args = "/ADD "
+Else
+  ' Video: Media Player Classic, wherever it landed.
+  candidates = Array( _
+    "C:\Program Files\Media Player Classic\mplayerc.exe", _
+    "C:\Program Files\Media Player Classic\mpc-hc.exe", _
+    "C:\Program Files\MPC\mplayerc.exe", _
+    "C:\Program Files\K-Lite Codec Pack\Media Player Classic\mplayerc.exe", _
+    "C:\MPC\mplayerc.exe", _
+    "C:\mplayerc.exe")
+End If
 
 player = ""
 For i = 0 To UBound(candidates)
@@ -70,14 +94,14 @@ For i = 0 To UBound(candidates)
 Next
 
 If player <> "" Then
-  sh.Run """" & player & """ """ & p & """", 1, False
+  sh.Run """" & player & """ " & args & """" & p & """", 1, False
 Else
-  ' No MPC found - use the shell association for .mpg instead of failing.
+  ' Nothing found - use the shell association rather than failing.
   On Error Resume Next
   CreateObject("Shell.Application").ShellExecute p
   If Err.Number <> 0 Then
-    MsgBox "No player found and the shell refused to open:" & vbCrLf & p, _
-           16, "youtube98"
+    MsgBox "No player found for ." & ext & " and the shell refused to " & _
+           "open:" & vbCrLf & p, 16, "youtube98"
     WScript.Quit 1
   End If
 End If
