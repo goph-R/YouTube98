@@ -29,7 +29,16 @@ const OUT_DIR = process.env.YT98_OUT || path.join(os.homedir(), 'youtube98');
 const TMP_DIR = path.join(OUT_DIR, '.tmp');
 const JOB_DIR = path.join(BASE, 'cache', 'jobs');
 
-const KEEP_BYTES = Math.round(parseFloat(process.env.YT98_KEEP_GB || '20') * 1024 * 1024 * 1024);
+const GB = 1024 * 1024 * 1024;
+const KEEP_BYTES = Math.round(parseFloat(process.env.YT98_KEEP_GB || '20') * GB);
+/*
+ * Audio has its own cap, enforced independently.
+ *
+ * An MP3 is ~2 MB against a video's ~200 MB, so sharing one cap would let
+ * a couple of long video downloads evict a lot of music — and music is
+ * more often something you keep than a watched video.
+ */
+const KEEP_AUDIO_BYTES = Math.round(parseFloat(process.env.YT98_KEEP_AUDIO_GB || '5') * GB);
 // 0 disables the age rule; the size cap is the primary control.
 const KEEP_DAYS = parseInt(process.env.YT98_KEEP_DAYS || '0', 10);
 // Orphaned partial downloads in .tmp/ older than this are junk.
@@ -44,6 +53,8 @@ const TMP_STALE_HOURS = 6;
  */
 const MOVIE = new RegExp('^([A-Za-z0-9_-]{11})(' +
   PROF.knownExts.map((e) => e.replace('.', '\\.')).join('|') + ')$');
+const AUDIO = new RegExp('^([A-Za-z0-9_-]{11})' +
+  PROF.audioExt.replace('.', '\\.') + '$');
 
 function log(msg) {
   console.log('[retention] ' + msg);
@@ -53,7 +64,7 @@ function gb(bytes) {
   return (bytes / 1073741824).toFixed(2) + ' GB';
 }
 
-function listMovies() {
+function listFiles(match) {
   let names;
   try {
     names = fs.readdirSync(OUT_DIR);
@@ -62,7 +73,7 @@ function listMovies() {
   }
   const out = [];
   for (const name of names) {
-    const m = MOVIE.exec(name);
+    const m = match.exec(name);
     if (!m) continue;
     const full = path.join(OUT_DIR, name);
     let st;
@@ -94,8 +105,8 @@ function listMovies() {
   return out;
 }
 
-function dropJobRecord(id, dry) {
-  const rec = path.join(JOB_DIR, id + '.json');
+function dropJobRecord(id, dry, kind) {
+  const rec = path.join(JOB_DIR, id + (kind === 'audio' ? '.audio' : '') + '.json');
   if (!fs.existsSync(rec)) return;
   if (dry) return;
   try {
@@ -105,7 +116,7 @@ function dropJobRecord(id, dry) {
   }
 }
 
-function remove(movie, why, dry) {
+function remove(movie, why, dry, kind) {
   log((dry ? 'would delete ' : 'deleting ') + movie.name +
       ' (' + gb(movie.size) + ', ' + why + ')');
   if (dry) return movie.size;
@@ -117,7 +128,7 @@ function remove(movie, why, dry) {
   }
   // Leaving the record behind is harmless but it accumulates, and the
   // page is file-driven anyway.
-  dropJobRecord(movie.id, dry);
+  dropJobRecord(movie.id, dry, kind);
   return movie.size;
 }
 
@@ -149,15 +160,13 @@ function sweepTmp(dry) {
   return freed;
 }
 
-function enforce(options) {
-  const dry = !!(options && options.dryRun);
-  const quiet = !!(options && options.quiet);
-
-  const movies = listMovies();
-  let total = movies.reduce((n, m) => n + m.size, 0);
+function enforceOne(match, cap, kind, dry, quiet) {
+  const files = listFiles(match);
+  let total = files.reduce((n, m) => n + m.size, 0);
 
   if (!quiet || dry) {
-    log(movies.length + ' movies, ' + gb(total) + ' / cap ' + gb(KEEP_BYTES));
+    log(kind + ': ' + files.length + ' file(s), ' + gb(total) +
+        ' / cap ' + gb(cap));
   }
 
   let freed = 0;
@@ -166,31 +175,43 @@ function enforce(options) {
   // Age rule first, if enabled: these are unwanted regardless of the cap.
   if (KEEP_DAYS > 0) {
     const cutoff = Date.now() - KEEP_DAYS * 86400 * 1000;
-    for (const m of movies) {
+    for (const m of files) {
       if (m.touched >= cutoff) continue;
-      const n = remove(m, 'older than ' + KEEP_DAYS + ' days', dry);
+      const n = remove(m, 'older than ' + KEEP_DAYS + ' days', dry, kind);
       if (n) { freed += n; total -= n; deleted++; m.gone = true; }
     }
   }
 
   // Then the size cap, oldest-touched first.
-  for (const m of movies) {
+  for (const m of files) {
     if (m.gone) continue;
-    if (total <= KEEP_BYTES) break;
-    const n = remove(m, 'over size cap', dry);
+    if (total <= cap) break;
+    const n = remove(m, 'over the ' + kind + ' cap', dry, kind);
     if (n) { freed += n; total -= n; deleted++; }
   }
 
-  freed += sweepTmp(dry);
+  return { deleted: deleted, freed: freed, total: total };
+}
+
+function enforce(options) {
+  const dry = !!(options && options.dryRun);
+  const quiet = !!(options && options.quiet);
+
+  // Video and audio are capped independently.
+  const v = enforceOne(MOVIE, KEEP_BYTES, 'video', dry, quiet);
+  const a = enforceOne(AUDIO, KEEP_AUDIO_BYTES, 'audio', dry, quiet);
+
+  let freed = v.freed + a.freed + sweepTmp(dry);
+  const deleted = v.deleted + a.deleted;
 
   if (deleted || freed) {
     log((dry ? 'would free ' : 'freed ') + gb(freed) + ' in ' + deleted +
-        ' movie(s); now ' + gb(total));
+        ' file(s); now ' + gb(v.total) + ' video + ' + gb(a.total) + ' audio');
   } else if (!quiet) {
-    log('nothing to do, under cap');
+    log('nothing to do, both under cap');
   }
 
-  return { deleted: deleted, freed: freed, total: total };
+  return { deleted: deleted, freed: freed, total: v.total + a.total };
 }
 
 module.exports = { enforce: enforce };

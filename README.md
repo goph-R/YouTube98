@@ -216,7 +216,10 @@ write them out for you.
 | `YT98_FEED` | `:ytrec` | feed source (see below) |
 | `YT98_LIMIT` | `150` | how many entries to ingest |
 | `YT98_YTDLP` | `~/.local/bin/yt-dlp` (Windows: `yt-dlp.exe` on PATH) | yt-dlp binary |
-| `YT98_KEEP_GB` | `20` | retention size cap |
+| `YT98_KEEP_GB` | `20` | retention size cap for video |
+| `YT98_KEEP_AUDIO_GB` | `5` | retention size cap for MP3s, enforced separately |
+| `YT98_MP3_AB` | `192` | MP3 bitrate in kbps |
+| `YT98_MP3_CODEC` | `libmp3lame` | audio encoder |
 | `YT98_KEEP_DAYS` | `0` | optional age cap, 0 = off |
 | `YT98_THUMB_WORKERS` | `6` | parallel thumbnail fetches |
 
@@ -284,6 +287,24 @@ stutters, the levers in order of effect are **fps**, then **width**, then
 for output accepts every known extension, and the page is told each
 video's real extension, so a library can hold both `.mpg` and `.avi`.
 
+#### MP3 output
+
+The **MP3** button is per job, not a profile — `<id>.mp3` can sit beside
+`<id>.avi` for the same video, with separate job records
+(`<id>.json` and `<id>.audio.json`) and separate progress.
+
+Tags matter more than usual here, because the filename is only the video
+id: **ID3v2.3 *and* ID3v1 are both written**, which is the pair Winamp on
+Win98 reads reliably (v2.4 is poorly supported by players of that era).
+Title comes from the video, artist from the channel, and the id goes in
+the comment field so the file stays traceable. Astral-plane characters
+(emoji) are stripped, since ID3v2.3 stores text as UCS-2 and cannot
+represent them.
+
+MP3s have **their own retention cap** (`YT98_KEEP_AUDIO_GB`, default 5 GB)
+enforced independently of video, so a couple of long video downloads
+cannot evict a lot of music.
+
 ### Feed sources
 
 yt-dlp exposes the account's own feeds. All need cookies:
@@ -305,6 +326,12 @@ they appear on the retro box as a deliberate list.
 - **Download** — queues the video. The button caption becomes a progress
   bar, `D[####------] 40%` while downloading and `C[...]` while
   transcoding.
+- **MP3** — the small button below it queues an audio-only download.
+  Independent of the video job: a video can have both, or just one. No
+  video stream is fetched at all, so it is a fraction of the bytes
+  (~5 MB against ~30 MB) and much quicker. Captions are abbreviated to
+  fit: `MP3` → `D40%` → `C40%` → `OK`, or `Err`. Clicking `OK` copies the
+  `.mp3` path.
 - **Stopping a job** — click an in-progress button once; it arms, showing
   `STOP? click again`. Click again within 4 seconds to cancel. (No
   `confirm()` dialog: IE5's return value is not dependable.) The partial

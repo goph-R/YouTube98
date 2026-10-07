@@ -84,6 +84,14 @@ function setPublicMode(on) {
 let refreshing = false;
 let lastRefresh = null;
 
+/*
+ * "audio" or "video" from a request. Anything unrecognised means video,
+ * so an old client or a hand-typed URL keeps working.
+ */
+function kindOf(v) {
+  return String(v == null ? '' : v).toLowerCase() === 'audio' ? 'audio' : 'video';
+}
+
 function truthy(v) {
   const s = String(v == null ? '' : v).trim().toLowerCase();
   return s === '1' || s === 'true' || s === 'yes' || s === 'on';
@@ -163,13 +171,18 @@ function readFeed() {
 
 // --- jobs -----------------------------------------------------------------
 
-function jobPath(id) {
-  return path.join(JOB_DIR, id + '.json');
+/*
+ * Job records are per (video, kind): a video can have both an MP3 and a
+ * video file. The video kind keeps the original `<id>.json` name so
+ * records written before this feature stay valid.
+ */
+function jobPath(id, kind) {
+  return path.join(JOB_DIR, id + (kind === 'audio' ? '.audio' : '') + '.json');
 }
 
-function readJob(id) {
+function readJob(id, kind) {
   try {
-    return JSON.parse(fs.readFileSync(jobPath(id), 'utf8'));
+    return JSON.parse(fs.readFileSync(jobPath(id, kind), 'utf8'));
   } catch (e) {
     return null;
   }
@@ -180,15 +193,17 @@ function readJob(id) {
  * on disk outranks any job record: that is what makes the page correct
  * after a worker restart, a cache wipe, or a manual drop into OUT_DIR.
  */
-function jobState(id) {
+function jobState(id, kind) {
   /*
-   * Accept output from ANY profile, not just the active one. Switching
-   * YT98_PROFILE would otherwise make every previously downloaded file
-   * look as though it had never been fetched. The active profile's
-   * extension is tried first so a re-encode is preferred when both
-   * exist.
+   * For video, accept output from ANY profile, not just the active one.
+   * Switching YT98_PROFILE would otherwise make every previously
+   * downloaded file look as though it had never been fetched. The active
+   * profile's extension is tried first so a re-encode is preferred when
+   * both exist. Audio has exactly one extension.
    */
-  const exts = [PROF.ext].concat(PROF.knownExts.filter((e) => e !== PROF.ext));
+  const exts = kind === 'audio'
+    ? [PROF.audioExt]
+    : [PROF.ext].concat(PROF.knownExts.filter((e) => e !== PROF.ext));
   for (const ext of exts) {
     try {
       if (fs.statSync(path.join(OUT_DIR, id + ext)).size > 0) {
@@ -197,7 +212,7 @@ function jobState(id) {
     } catch (e) { /* try the next extension */ }
   }
 
-  const job = readJob(id);
+  const job = readJob(id, kind);
   if (!job) return { state: 'NONE', pct: 0 };
 
   /*
@@ -272,8 +287,8 @@ function startRefresh(nocookies) {
  * Only writes a flag: the worker owns the child processes and kills them
  * itself. Returns the state the button should show next.
  */
-function requestCancel(id) {
-  const job = readJob(id);
+function requestCancel(id, kind) {
+  const job = readJob(id, kind);
   if (!job) return { state: 'NONE', pct: 0 };
   if (!['QUEUED', 'DOWNLOADING', 'CONVERTING'].includes(job.state)) {
     return { state: job.state, pct: job.pct || 0 };
@@ -296,20 +311,21 @@ function requestCancel(id) {
     job.error = null;
   }
   job.updated = Math.floor(Date.now() / 1000);
-  const tmp = jobPath(id) + '.part';
+  const tmp = jobPath(id, kind) + '.part';
   fs.writeFileSync(tmp, JSON.stringify(job, null, 1));
-  fs.renameSync(tmp, jobPath(id));
-  console.log('cancel requested for ' + id + (instant ? ' (was queued, cancelled immediately)' : ''));
+  fs.renameSync(tmp, jobPath(id, kind));
+  console.log('cancel requested for ' + id + ' [' + kind + ']' +
+              (instant ? ' (was queued, cancelled immediately)' : ''));
   return { state: instant ? 'CANCELLED' : 'CANCELLING', pct: 0 };
 }
 
-function enqueue(id, feed) {
+function enqueue(id, feed, kind) {
   /*
    * Consult jobState(), not the raw record: it is the file-aware view.
    * Reading the record directly meant a stale READY record blocked
    * re-queuing a deleted movie forever.
    */
-  const st = jobState(id);
+  const st = jobState(id, kind);
   if (['QUEUED', 'DOWNLOADING', 'CONVERTING', 'READY'].includes(st.state)) {
     // idempotent: clicking twice must not queue twice, and an existing
     // file must never be re-encoded
@@ -318,17 +334,20 @@ function enqueue(id, feed) {
   const meta = (feed.videos || []).find((v) => v.id === id) || {};
   const job = {
     id: id,
+    kind: kind,
     state: 'QUEUED',
     pct: 0,
     title: meta.title || '',
+    // Carried for the ID3 artist tag on audio jobs.
+    channel: meta.channel || '',
     duration: meta.duration || 0,
     error: null,
     queued: Math.floor(Date.now() / 1000)
   };
   fs.mkdirSync(JOB_DIR, { recursive: true });
-  const tmp = jobPath(id) + '.part';
+  const tmp = jobPath(id, kind) + '.part';
   fs.writeFileSync(tmp, JSON.stringify(job, null, 1));
-  fs.renameSync(tmp, jobPath(id));
+  fs.renameSync(tmp, jobPath(id, kind));
   return job;
 }
 
@@ -356,6 +375,10 @@ const STYLE = [
    * takes `hand`. Last valid declaration wins in each.
    */
   '.t { cursor: pointer; cursor: hand; }',
+  // The MP3 button: narrow, monospace so its short captions ("D40%",
+  // "STOP?") do not resize it either.
+  '.a { width: 58px; font-family: "Courier New", Courier, monospace;',
+  '     font-size: 11px; margin-top: 2px; }',
   '.nav { padding: 4px; }'
 ].join('\n');
 
@@ -385,6 +408,21 @@ function progressLabel(phase, pct) {
   let bar = '';
   for (let i = 0; i < 10; i++) bar += i < n ? '#' : '-';
   return phase + '[' + bar + ']' + String(p).padStart(3, ' ') + '%';
+}
+
+/*
+ * Compact caption for the narrow MP3 button. The video button has 17
+ * characters to play with; this one has about five, so the bar is dropped
+ * and only the phase letter and percentage survive.
+ */
+function audioLabel(st) {
+  if (st.state === 'READY') return 'OK';
+  if (st.state === 'FAILED') return 'Err';
+  if (st.state === 'QUEUED') return '...';
+  if (st.state === 'CANCELLING') return 'stop';
+  if (st.state === 'DOWNLOADING') return 'D' + (st.pct || 0) + '%';
+  if (st.state === 'CONVERTING') return 'C' + (st.pct || 0) + '%';
+  return 'MP3';
 }
 
 function buttons(id, pending, states, exts) {
@@ -423,6 +461,18 @@ function buttons(id, pending, states, exts) {
   out.push('<input type="submit" class="b" id="b_' + j + '" value="' +
            esc(label) + '"' + disabled +
            ' onclick="act(\'' + j + '\'); return false;">');
+  /*
+   * The MP3 button sits on its own line rather than beside the video
+   * button: 136px + 56px would not fit a 200px cell at four columns, and
+   * vertical space is cheaper than rearranging the grid.
+   */
+  const ast = jobState(id, 'audio');
+  states['A' + id] = ast.state;
+  if (['QUEUED', 'DOWNLOADING', 'CONVERTING', 'CANCELLING'].includes(ast.state)) {
+    pending.push('A' + id);
+  }
+  out.push('<br><input type="button" class="a" id="a_' + j + '" value="' +
+           esc(audioLabel(ast)) + '" onclick="actA(\'' + j + '\')">');
   out.push('</form>');
   if (st.state === 'FAILED' && st.error) {
     out.push('<br><span class="meta">' + esc(clip(st.error, 60)) + '</span>');
@@ -597,6 +647,7 @@ function clientScript(pending, states, exts) {
   return '<script type="text/javascript">\n' +
          'var WINP = "' + winp + '";\n' +
          'var EXT = "' + PROF.ext + '";\n' +
+         'var AEXT = "' + PROF.audioExt + '";\n' +
          'var PENDING = [' + ids + '];\n' +
          'var ST0 = {};' + st0 + '\n' +
          'var EXT0 = {};' + ext0 + '\n' +
@@ -607,20 +658,20 @@ function clientScript(pending, states, exts) {
 const CLIENT_JS = [
     /*
      * IE5 crashed with an invalid page fault in JSCRIPT.DLL — a null
-     * dereference inside the script engine, not in MSXML. That is
-     * JScript 5.0's garbage-collector bug, and the old code fed it
-     * directly:
+     * dereference inside the script engine, which is JScript 5.0's
+     * garbage-collector bug. So this file contains NO function
+     * expressions at all: every function is named and global, timers are
+     * handed an existing function object, and no handler is ever
+     * reassigned.
      *
-     *   window.setTimeout(function () { poll(id); }, POLL)
+     * State is keyed by a composite string, not a bare video id, because
+     * each video now has two independent jobs:
      *
-     * allocated a fresh closure on every poll, recursively, forever; and
-     * ready() assigned a closure to a DOM element's onclick, creating the
-     * DOM <-> closure cycle that is the other half of that bug.
+     *   "<id>"     the video download
+     *   "A<id>"    the MP3 download
      *
-     * So: this file contains NO function expressions at all. Every
-     * function is named and global, every timer passes an existing
-     * function object, and no handler is ever reassigned. State lives in
-     * plain globals instead of being captured.
+     * One state machine serves both; only the element id, the caption
+     * width and the &kind= parameter differ.
      */
     'var seq = 0;',
     'var POLL = 2000;',
@@ -629,25 +680,25 @@ const CLIENT_JS = [
     'var REQ = null;',
     'var TIMER = null;',
     'var ST = {};',
-    // Last known percent per id, so an armed button can be restored to
-    // its progress caption without waiting for the next poll.
     'var PCT = {};',
-    /*
-     * Stop confirmation without confirm().
-     *
-     * IE5's confirm() return value is not trustworthy, and this is the
-     * same JScript 5.0 that already crashed on closures — so no dialog is
-     * used at all. Clicking an in-progress button arms it ("STOP? click
-     * again", deliberately also 17 characters so the button does not
-     * resize), and a second click within ARM_MS actually cancels.
-     * Anything else disarms it.
-     *
-     * One armed button at a time, held in a global, so the disarm timer
-     * can be a plain named function with nothing captured.
-     */
     'var ARMED = null;',
     'var ARM_TIMER = null;',
     'var ARM_MS = 4000;',
+
+    // ---- composite-key helpers -------------------------------------
+    'function isAudio(k) { return k.charAt(0) == "A"; }',
+    'function idOf(k) { return isAudio(k) ? k.substring(1) : k; }',
+    'function kindQ(k) { return isAudio(k) ? "&kind=audio" : ""; }',
+    'function el(k) {',
+    '  return document.getElementById((isAudio(k) ? "a_" : "b_") + idOf(k));',
+    '}',
+    'function thumb(id) { return document.getElementById("i_" + id); }',
+    'function label(k, text, enabled) {',
+    '  var b = el(k);',
+    '  if (!b) { return; }',
+    '  b.value = text;',
+    '  b.disabled = !enabled;',
+    '}',
 
     // ---- transport: one reused object, synchronous ------------------
     'function getreq() {',
@@ -672,18 +723,8 @@ const CLIENT_JS = [
     '  } catch (e3) { return null; }',
     '}',
 
-    // ---- dom helpers -----------------------------------------------
-    'function btn(id) { return document.getElementById("b_" + id); }',
-    'function thumb(id) { return document.getElementById("i_" + id); }',
-    'function label(id, text, enabled) {',
-    '  var b = btn(id);',
-    '  if (!b) { return; }',
-    '  b.value = text;',
-    '  b.disabled = !enabled;',
-    '}',
-
-    // Fixed 17 chars: D[####------] 40% — must match progressLabel()
-    // on the server so the caption does not jump on the first poll.
+    // ---- captions ---------------------------------------------------
+    // Fixed 17 chars for the video button: D[####------] 40%
     'function bar(phase, pct) {',
     '  var n;',
     '  if (isNaN(pct)) { pct = 0; }',
@@ -700,36 +741,29 @@ const CLIENT_JS = [
     '  while (p.length < 3) { p = " " + p; }',
     '  return phase + "[" + s + "]" + p + "%";',
     '}',
+    // The MP3 button is ~56px, so no room for a bar: phase letter + pct.
+    'function shortCap(phase, pct) { return phase + pct + "%"; }',
+    'function progCap(k, phase, pct) {',
+    '  return isAudio(k) ? shortCap(phase, pct) : bar(phase, pct);',
+    '}',
+    'function idleCap(k) { return isAudio(k) ? "MP3" : "Download"; }',
+    'function doneCap(k) { return isAudio(k) ? "OK" : "Play"; }',
+    'function failCap(k) { return isAudio(k) ? "Err" : "Retry"; }',
+    'function armCap(k) { return isAudio(k) ? "STOP?" : "STOP? click again"; }',
 
-    // ---- actions ----------------------------------------------------
-    // Extension per video, because a page can legitimately mix output
-    // from two profiles; EXT is the active profile's default.
+    // ---- paths ------------------------------------------------------
     'function winPath(id) { return WINP + id + (EXT0[id] || EXT); }',
+    'function audioPath(id) { return WINP + id + AEXT; }',
     'function play(id) { window.location.href = "youtube98:" + winPath(id); }',
-    // clipboardData.setData returns a boolean and can also be refused
-    // outright by the IE security zone, so check both and always fall
-    // back to a prompt the path can be copied out of by hand.
-    // Bound to the thumbnail. Silently ignores anything not downloaded
-    // yet, so a stray click on a thumbnail never hands back a path to a
-    // file that does not exist.
     /*
-     * Four ways to put a path on the clipboard, because the two target
-     * browsers share none of them:
-     *
-     *  1. IE5          window.clipboardData.setData
-     *  2. modern+https navigator.clipboard (secure contexts only, which
-     *                  includes http://localhost)
-     *  3. modern+http  select a hidden input + execCommand("copy"), for
-     *                  when the page is reached by LAN IP and is
-     *                  therefore not a secure context
-     *  4. anything     prompt(), copyable by hand
-     *
-     * No .then() on the clipboard promise: attaching one would mean a
-     * function expression, which is what crashes JScript 5.0.
+     * Four clipboard routes, because the two target browsers share none:
+     * IE5's clipboardData, modern navigator.clipboard (secure contexts
+     * only, which includes http://localhost), execCommand against an
+     * off-screen input for plain http by IP, and finally prompt().
+     * No .then() on the promise — a function expression there is exactly
+     * what faults JScript 5.0.
      */
-    'function copyPath(id) {',
-    '  if (ST[id] != "READY") { return; }',
-    '  var p = winPath(id);',
+    'function putClip(p) {',
     '  var ok = false;',
     '  try {',
     '    if (window.clipboardData && window.clipboardData.setData) {',
@@ -758,141 +792,143 @@ const CLIENT_JS = [
     '  if (ok) { alert("Copied to clipboard:\\n" + p); }',
     '  else { prompt("Copy this path (Ctrl+C):", p); }',
     '}',
+    'function copyPath(id) {',
+    '  if (ST[id] != "READY") { return; }',
+    '  putClip(winPath(id));',
+    '}',
 
-    /*
-     * Single dispatcher. The inline onclick is always act('<id>') and is
-     * never rewritten, which is what keeps closures off DOM elements.
-     * What the button does is decided from ST, not from which handler
-     * happens to be attached.
-     */
+    // ---- arming (no confirm(): IE5's return value is not dependable) -
     'function busy(s) {',
     '  return s == "QUEUED" || s == "DOWNLOADING" || s == "CONVERTING";',
     '}',
-    'function restore(id) {',
-    '  var s = ST[id];',
-    '  if (s == "DOWNLOADING") { label(id, bar("D", PCT[id] || 0), true); }',
-    '  else if (s == "CONVERTING") { label(id, bar("C", PCT[id] || 0), true); }',
-    '  else if (s == "QUEUED") { label(id, "Queued...", true); }',
+    'function restore(k) {',
+    '  var s = ST[k];',
+    '  if (s == "DOWNLOADING") { label(k, progCap(k, "D", PCT[k] || 0), true); }',
+    '  else if (s == "CONVERTING") { label(k, progCap(k, "C", PCT[k] || 0), true); }',
+    '  else if (s == "QUEUED") { label(k, isAudio(k) ? "..." : "Queued...", true); }',
     '}',
     'function disarm() {',
     '  ARM_TIMER = null;',
     '  if (!ARMED) { return; }',
-    '  var id = ARMED;',
+    '  var k = ARMED;',
     '  ARMED = null;',
-    '  restore(id);',
+    '  restore(k);',
     '}',
-    'function arm(id) {',
+    'function arm(k) {',
     '  if (ARM_TIMER != null) { window.clearTimeout(ARM_TIMER); ARM_TIMER = null; }',
-    '  if (ARMED && ARMED != id) { var old = ARMED; ARMED = null; restore(old); }',
-    '  ARMED = id;',
-    '  label(id, "STOP? click again", true);',
+    '  if (ARMED && ARMED != k) { var old = ARMED; ARMED = null; restore(old); }',
+    '  ARMED = k;',
+    '  label(k, armCap(k), true);',
     '  ARM_TIMER = window.setTimeout(disarm, ARM_MS);',
     '}',
-    'function stop(id) {',
+    'function stop(k) {',
     '  if (ARM_TIMER != null) { window.clearTimeout(ARM_TIMER); ARM_TIMER = null; }',
     '  ARMED = null;',
-    '  label(id, "Stopping...", false);',
-    '  var t = httpSync("POST", "/cancel?id=" + id + "&_=" + (seq++), "id=" + id);',
-    '  if (t == null) { restore(id); return; }',
-    '  absorb(id, t);',
+    '  label(k, isAudio(k) ? "stop" : "Stopping...", false);',
+    '  var t = httpSync("POST", "/cancel?id=" + idOf(k) + kindQ(k) + "&_=" + (seq++), "");',
+    '  if (t == null) { restore(k); return; }',
+    '  absorb(k, t);',
     '  schedule();',
     '}',
-    'function act(id) {',
-    '  var s = ST[id];',
-    '  if (s == "READY") { play(id); return; }',
-    // In-progress: first click arms, second click within ARM_MS stops.
+
+    // ---- actions ----------------------------------------------------
+    /*
+     * Single dispatcher per kind. The inline onclick never changes, which
+     * is what keeps closures off DOM elements; what the button does is
+     * decided from ST.
+     */
+    'function core(k) {',
+    '  var s = ST[k];',
+    '  if (s == "READY") {',
+    '    if (isAudio(k)) { putClip(audioPath(idOf(k))); } else { play(idOf(k)); }',
+    '    return;',
+    '  }',
     '  if (busy(s)) {',
-    '    if (ARMED == id) { stop(id); } else { arm(id); }',
+    '    if (ARMED == k) { stop(k); } else { arm(k); }',
     '    return;',
     '  }',
     '  if (s == "CANCELLING") { return; }',
-    '  start(id);',
+    '  start(k);',
     '}',
-    'function start(id) {',
-    '  label(id, "Starting...", false);',
-    '  ST[id] = "QUEUED";',
-    '  push(id);',
-    '  var t = httpSync("POST", "/enqueue?id=" + id + "&_=" + (seq++), "id=" + id);',
+    'function act(id) { core(id); }',
+    'function actA(id) { core("A" + id); }',
+    'function start(k) {',
+    '  label(k, isAudio(k) ? "..." : "Starting...", false);',
+    '  ST[k] = "QUEUED";',
+    '  push(k);',
+    '  var t = httpSync("POST", "/enqueue?id=" + idOf(k) + kindQ(k) + "&_=" + (seq++),',
+    '                   "id=" + idOf(k) + (isAudio(k) ? "&kind=audio" : ""));',
     '  if (t == null) {',
-    '    ST[id] = "NONE";',
-    '    drop(id);',
-    '    label(id, "Error", true);',
+    '    ST[k] = "NONE";',
+    '    drop(k);',
+    '    label(k, isAudio(k) ? "Err" : "Error", true);',
     '    return;',
     '  }',
-    '  absorb(id, t);',
+    '  absorb(k, t);',
     '  schedule();',
     '}',
 
     // ---- pending list (no shift/splice: JScript 5.0 era) ------------
-    'function push(id) {',
-    '  for (var i = 0; i < PEND.length; i++) { if (PEND[i] == id) { return; } }',
-    '  PEND[PEND.length] = id;',
+    'function push(k) {',
+    '  for (var i = 0; i < PEND.length; i++) { if (PEND[i] == k) { return; } }',
+    '  PEND[PEND.length] = k;',
     '}',
-    'function drop(id) {',
+    'function drop(k) {',
     '  var out = [];',
     '  for (var i = 0; i < PEND.length; i++) {',
-    '    if (PEND[i] != id) { out[out.length] = PEND[i]; }',
+    '    if (PEND[i] != k) { out[out.length] = PEND[i]; }',
     '  }',
     '  PEND = out;',
     '  IDX = 0;',
     '}',
 
     // ---- status -----------------------------------------------------
-    'function absorb(id, text) {',
+    'function absorb(k, text) {',
     '  var parts = ("" + text).split(" ");',
     '  var st = parts[0];',
     '  var pct = parseInt(parts[1], 10);',
     '  if (isNaN(pct)) { pct = 0; }',
-    '  ST[id] = st;',
-    '  PCT[id] = pct;',
+    '  ST[k] = st;',
+    '  PCT[k] = pct;',
     '  if (st == "READY") {',
-    '    drop(id);',
-    '    if (ARMED == id) { ARMED = null; }',
-    '    label(id, "Play", true);',
-    // Give the thumbnail its hand cursor and tooltip now that there is
-    // a file to copy a path to. Property sets only, no closures.
-    '    var im = thumb(id);',
-    '    if (im) { im.className = "t"; im.title = "Click to copy path"; }',
+    '    drop(k);',
+    '    if (ARMED == k) { ARMED = null; }',
+    '    label(k, doneCap(k), true);',
+    '    if (!isAudio(k)) {',
+    '      var im = thumb(idOf(k));',
+    '      if (im) { im.className = "t"; im.title = "Click to copy path"; }',
+    '    }',
     '    return;',
     '  }',
     '  if (st == "FAILED") {',
-    '    drop(id);',
-    '    if (ARMED == id) { ARMED = null; }',
-    '    label(id, "Retry", true);',
+    '    drop(k);',
+    '    if (ARMED == k) { ARMED = null; }',
+    '    label(k, failCap(k), true);',
     '    return;',
     '  }',
-    // Cancelled, or no record at all: back to a plain Download button.
     '  if (st == "CANCELLED" || st == "NONE") {',
-    '    drop(id);',
-    '    if (ARMED == id) { ARMED = null; }',
-    '    ST[id] = "NONE";',
-    '    label(id, "Download", true);',
+    '    drop(k);',
+    '    if (ARMED == k) { ARMED = null; }',
+    '    ST[k] = "NONE";',
+    '    label(k, idleCap(k), true);',
     '    return;',
     '  }',
-    '  if (st == "CANCELLING") { label(id, "Stopping...", false); return; }',
-    // An armed button keeps its "STOP? click again" caption. Progress is
-    // still recorded in PCT, so disarming restores the right number.
-    '  if (ARMED == id) { return; }',
-    // Enabled, not disabled: the button is also the stop control now.
-    '  if (st == "DOWNLOADING") { label(id, bar("D", pct), true); return; }',
-    '  if (st == "CONVERTING") { label(id, bar("C", pct), true); return; }',
-    '  label(id, "Queued...", true);',
+    '  if (st == "CANCELLING") { label(k, isAudio(k) ? "stop" : "Stopping...", false); return; }',
+    '  if (ARMED == k) { return; }',
+    '  if (st == "DOWNLOADING") { label(k, progCap(k, "D", pct), true); return; }',
+    '  if (st == "CONVERTING") { label(k, progCap(k, "C", pct), true); return; }',
+    '  label(k, isAudio(k) ? "..." : "Queued...", true);',
     '}',
 
-    /*
-     * The poll loop. One named function, rotated over PEND by index
-     * (no Array.shift, which is not dependable this far back), and
-     * setTimeout is handed the existing `tick` object — so not one
-     * closure is allocated no matter how long a job runs.
-     */
+    // ---- poll loop: one named function, no closures ever ------------
     'function tick() {',
     '  TIMER = null;',
     '  if (PEND.length == 0) { return; }',
     '  if (IDX >= PEND.length) { IDX = 0; }',
-    '  var id = PEND[IDX];',
+    '  var k = PEND[IDX];',
     '  IDX = IDX + 1;',
-    '  var t = httpSync("GET", "/status?id=" + id + "&_=" + (seq++), null);',
-    '  if (t != null) { absorb(id, t); }',
+    '  var t = httpSync("GET", "/status?id=" + idOf(k) + kindQ(k) + "&_=" + (seq++), null);',
+    '  if (t != null) { absorb(k, t); }',
     '  schedule();',
     '}',
     'function schedule() {',
@@ -901,9 +937,6 @@ const CLIENT_JS = [
     '  TIMER = window.setTimeout(tick, POLL);',
     '}',
 
-    // onsubmit guard: with scripting off this never runs and the form
-    // posts normally; with scripting on the inline onclick has already
-    // done the work.
     'function submitted(id) { return false; }',
 
     'function boot() {',
@@ -1091,9 +1124,12 @@ const server = http.createServer((req, res) => {
       if (!VIDEO_ID.test(id || '')) {
         return send(res, 400, 'text/plain', 'FAILED bad id');
       }
+      const km = /(?:^|&)kind=([^&]*)/.exec(body);
+      const kind = kindOf(url.searchParams.get('kind') ||
+                          (km ? decodeURIComponent(km[1]) : ''));
       let job;
       try {
-        job = enqueue(id, readFeed());
+        job = enqueue(id, readFeed(), kind);
       } catch (e) {
         return send(res, 500, 'text/plain', 'FAILED ' + e.message);
       }
@@ -1111,14 +1147,14 @@ const server = http.createServer((req, res) => {
   if (pathname === '/cancel' && req.method === 'POST') {
     const id = url.searchParams.get('id');
     if (!VIDEO_ID.test(id || '')) return send(res, 400, 'text/plain', 'FAILED bad id');
-    const st = requestCancel(id);
+    const st = requestCancel(id, kindOf(url.searchParams.get('kind')));
     return send(res, 200, 'text/plain', st.state + ' ' + (st.pct || 0));
   }
 
   if (pathname === '/status') {
     const id = url.searchParams.get('id');
     if (!VIDEO_ID.test(id || '')) return send(res, 400, 'text/plain', 'FAILED bad id');
-    const st = jobState(id);
+    const st = jobState(id, kindOf(url.searchParams.get('kind')));
     return send(res, 200, 'text/plain', st.state + ' ' + (st.pct || 0));
   }
 

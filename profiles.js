@@ -132,11 +132,35 @@ const PROFILE = {
   cbr:    base.cbr
 };
 
-// Every extension any profile can produce, so looking for existing
+// Every video extension any profile can produce, so looking for existing
 // output never misses a file made under a different profile.
 const KNOWN_EXTS = Object.keys(PROFILES).map((k) => PROFILES[k].ext)
   .concat([PROFILE.ext])
   .filter((e, i, a) => a.indexOf(e) === i);
+
+/*
+ * Audio-only output, requested per job rather than per profile — a video
+ * and an MP3 of the same id can both exist.
+ *
+ * ID3v2.3 *and* ID3v1 are both written on purpose: that is the pair
+ * Winamp on Win98 reads reliably, and v2.4 is not well supported by
+ * players of that era. Since the filename is only the video id, the tags
+ * are the only thing carrying the title and channel.
+ */
+const AUDIO = {
+  ext: '.mp3',
+  desc: 'MP3 audio only (ID3v2.3 + ID3v1 for Winamp on Win98)',
+  acodec: process.env.YT98_MP3_CODEC || 'libmp3lame',
+  ab: Math.round(num('YT98_MP3_AB', 192))
+};
+
+function audioArgs(a) {
+  return [
+    '-vn',
+    '-c:a', a.acodec, '-ar', '44100', '-ac', '2', '-b:a', a.ab + 'k',
+    '-id3v2_version', '3', '-write_id3v1', '1'
+  ];
+}
 
 /*
  * Scale to fit inside the box without distorting, then pad both axes up
@@ -184,7 +208,11 @@ module.exports = {
   args: ffmpegArgs(PROFILE),
   vf: videoFilter(PROFILE),
   knownExts: KNOWN_EXTS,
-  all: PROFILES
+  all: PROFILES,
+  // audio is a per-job choice, not a profile
+  audio: AUDIO,
+  audioExt: AUDIO.ext,
+  audioArgs: audioArgs(AUDIO)
 };
 
 if (require.main === module) {
@@ -201,6 +229,9 @@ if (require.main === module) {
   console.log('\nResolved settings for "' + NAME + '":');
   console.log('  -vf ' + videoFilter(PROFILE));
   console.log('  ' + ffmpegArgs(PROFILE).join(' '));
+  console.log('\nAudio-only output (per job, the MP3 button):');
+  console.log('  ' + AUDIO.ext + '  ' + audioArgs(AUDIO).join(' '));
   console.log('\nOverridable: YT98_WIDTH YT98_HEIGHT YT98_FPS YT98_VB YT98_AB');
   console.log('             YT98_VCODEC YT98_VTAG YT98_ACODEC YT98_EXT');
+  console.log('             YT98_MP3_AB YT98_MP3_CODEC');
 }

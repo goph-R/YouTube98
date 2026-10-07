@@ -66,23 +66,53 @@ const EXT = PROF.ext;
 
 // --- job store ------------------------------------------------------------
 
-function jobPath(id) {
-  return path.join(JOB_DIR, id + '.json');
+/*
+ * Job records are per (video, kind), because a video can have both an
+ * MP3 and a video file. The video kind deliberately keeps the old
+ * `<id>.json` name so existing records stay valid with no migration.
+ */
+function jobPath(id, kind) {
+  return path.join(JOB_DIR, id + (kind === 'audio' ? '.audio' : '') + '.json');
 }
 
-function readJob(id) {
+const JOB_FILE = /^([A-Za-z0-9_-]{11})(\.audio)?\.json$/;
+
+// Output extension for a job: audio is fixed, video follows the profile.
+function extFor(kind) {
+  return kind === 'audio' ? PROF.audioExt : EXT;
+}
+
+function readJob(id, kind) {
   try {
-    return JSON.parse(fs.readFileSync(jobPath(id), 'utf8'));
+    return JSON.parse(fs.readFileSync(jobPath(id, kind), 'utf8'));
   } catch (e) {
     return null;
   }
 }
 
 function writeJob(job) {
+  /*
+   * Re-read `cancel` from disk before writing.
+   *
+   * The server sets cancel:true on the file; the worker holds an older
+   * in-memory copy and writes progress to that same file every 2%.
+   * Without this, a progress write silently ERASES a cancel request that
+   * arrived since the job was picked up, so Stop could simply be ignored
+   * depending on whether the cancel poll happened to land before the
+   * next progress write. Video cancels only ever worked by that luck.
+   *
+   * Latches cancel on, never off: clearing it is the worker's job once it
+   * has acted on it.
+   */
+  if (!job.cancel) {
+    const onDisk = readJob(job.id, job.kind);
+    if (onDisk && onDisk.cancel) job.cancel = true;
+  }
   job.updated = Math.floor(Date.now() / 1000);
-  const tmp = jobPath(job.id) + '.part';
+  const tmp = jobPath(job.id, job.kind) + '.part';
   fs.writeFileSync(tmp, JSON.stringify(job, null, 1));
-  fs.renameSync(tmp, jobPath(job.id)); // atomic: /status never sees a half file
+  // atomic: /status never sees a half-written record
+  fs.renameSync(tmp, jobPath(job.id, job.kind));
 }
 
 function setState(job, state, extra) {
@@ -93,7 +123,8 @@ function setState(job, state, extra) {
   // Progress now ticks every 2%, which would be ~50 log lines per phase.
   // Log transitions always, progress only at 20% marks.
   if (prev !== state || (job.pct || 0) % 20 === 0) {
-    log(job.id + ' -> ' + state + (job.pct ? ' ' + job.pct + '%' : ''));
+    log(job.id + (job.kind === 'audio' ? ' [mp3]' : '') +
+        ' -> ' + state + (job.pct ? ' ' + job.pct + '%' : ''));
   }
 }
 
@@ -118,8 +149,8 @@ function log(msg) {
  */
 class Cancelled extends Error {}
 
-function cancelRequested(id) {
-  const job = readJob(id);
+function cancelRequested(id, kind) {
+  const job = readJob(id, kind);
   return !!(job && job.cancel);
 }
 
@@ -132,7 +163,7 @@ function run(cmd, args, onLine, job) {
 
     // Only watch for cancellation when a job owns this child.
     const watch = job ? setInterval(() => {
-      if (killed || !cancelRequested(job.id)) return;
+      if (killed || !cancelRequested(job.id, job.kind)) return;
       killed = true;
       log(job.id + ' cancel requested, terminating ' + cmd);
       // Windows has no real SIGTERM: Node maps kill() to
@@ -168,7 +199,8 @@ function run(cmd, args, onLine, job) {
 
 function findTmpSource(id) {
   const hit = fs.readdirSync(TMP_DIR).filter(
-    (f) => f.startsWith(id + '.') && !f.endsWith(EXT) && !f.endsWith('.part')
+    (f) => f.startsWith(id + '.') && !f.endsWith(EXT) &&
+           !f.endsWith(PROF.audioExt) && !f.endsWith('.part')
   );
   return hit.length ? path.join(TMP_DIR, hit[0]) : null;
 }
@@ -190,11 +222,14 @@ function clearTmp(id) {
  * than the download saves.
  */
 const FORMAT_ARGS = ['-f', 'bv*+ba/b', '-S', 'res:480,vcodec:h264'];
+// Audio-only: no video stream is fetched at all, so this is both much
+// faster and a fraction of the bytes (~5 MB against ~30 MB).
+const AUDIO_FORMAT_ARGS = ['-f', 'ba/b'];
 
 function downloadAttempt(job, useCookies, onPct) {
   const args = ['--newline', '--no-playlist', '--no-warnings']
     .concat(useCookies ? ['--cookies', COOKIES] : [])
-    .concat(FORMAT_ARGS, [
+    .concat(job.kind === 'audio' ? AUDIO_FORMAT_ARGS : FORMAT_ARGS, [
       '-o', path.join(TMP_DIR, '%(id)s.%(ext)s'),
       'https://www.youtube.com/watch?v=' + job.id
     ]);
@@ -261,6 +296,36 @@ async function download(job) {
  * convert bar would sit at 0% for the whole encode. Probing the file
  * makes progress independent of whatever the feed knew.
  */
+/*
+ * ID3 metadata for audio jobs.
+ *
+ * Astral-plane characters (emoji) are stripped: ID3v2.3 stores text as
+ * UCS-2, which cannot represent them, and players of that era render the
+ * result as garbage. Control characters go too, since some taggers treat
+ * them as field separators.
+ */
+function id3Safe(v) {
+  let out = '';
+  for (const ch of String(v == null ? '' : v)) {
+    const cp = ch.codePointAt(0);
+    if (cp > 0xffff) continue;
+    if (cp < 32) continue;
+    out += ch;
+  }
+  return out.trim().slice(0, 120);
+}
+
+function tagArgs(job) {
+  const a = [];
+  const title = id3Safe(job.title);
+  const artist = id3Safe(job.channel);
+  if (title) a.push('-metadata', 'title=' + title);
+  if (artist) a.push('-metadata', 'artist=' + artist);
+  // Keeps the video id recoverable from the file itself.
+  a.push('-metadata', 'comment=youtube98 ' + job.id);
+  return a;
+}
+
 async function probeDuration(src) {
   const res = await run('ffprobe', [
     '-v', 'error',
@@ -280,9 +345,19 @@ async function transcode(job, src) {
     if (job.duration) log(job.id + ' probed duration ' + job.duration + 's');
   }
 
-  const tmpOut = path.join(TMP_DIR, job.id + EXT);
-  const args = ['-y', '-loglevel', 'info', '-i', src, '-vf', VF]
-    .concat(FFMPEG_ARGS, [tmpOut]);
+  const audio = (job.kind === 'audio');
+  const tmpOut = path.join(TMP_DIR, job.id + extFor(job.kind));
+
+  /*
+   * Audio jobs skip the scale/pad filter entirely and carry ID3 tags
+   * instead. The filename is only the video id, so the tags are the only
+   * place the title and channel survive — which is what Winamp shows.
+   */
+  const args = audio
+    ? ['-y', '-loglevel', 'info', '-i', src]
+        .concat(PROF.audioArgs, tagArgs(job), [tmpOut])
+    : ['-y', '-loglevel', 'info', '-i', src, '-vf', VF]
+        .concat(FFMPEG_ARGS, [tmpOut]);
 
   const total = job.duration > 0 ? job.duration : 0;
   let last = 0;
@@ -303,7 +378,7 @@ async function transcode(job, src) {
 
   // Same filesystem, so this is atomic: the PII never sees a partial .mpg
   // appear on the share.
-  const finalOut = path.join(OUT_DIR, job.id + EXT);
+  const finalOut = path.join(OUT_DIR, job.id + extFor(job.kind));
   fs.renameSync(tmpOut, finalOut);
   try { fs.unlinkSync(src); } catch (e) { /* best effort */ }
   return finalOut;
@@ -374,11 +449,15 @@ async function runJob(job) {
 function nextQueued() {
   let best = null;
   for (const f of fs.readdirSync(JOB_DIR)) {
-    if (!f.endsWith('.json')) continue;
-    const id = f.slice(0, -5);
+    const m = JOB_FILE.exec(f);
+    if (!m) continue;
+    const id = m[1];
+    const kind = m[2] ? 'audio' : 'video';
     if (!VIDEO_ID.test(id)) continue;
-    const job = readJob(id);
+    const job = readJob(id, kind);
     if (!job) continue;
+    // Records written before the audio feature have no kind.
+    if (!job.kind) job.kind = kind;
     // Anything left mid-flight by a worker restart is retried.
     if (job.state === 'QUEUED' || job.state === 'DOWNLOADING' ||
         job.state === 'CONVERTING') {
@@ -405,7 +484,7 @@ async function loop() {
         continue;
       }
       // If the output already exists, do not re-encode it.
-      const existing = path.join(OUT_DIR, job.id + EXT);
+      const existing = path.join(OUT_DIR, job.id + extFor(job.kind));
       if (fs.existsSync(existing) && fs.statSync(existing).size > 0) {
         setState(job, 'READY', {
           pct: 100,
@@ -447,7 +526,8 @@ function main() {
   process.on('SIGTERM', release);
 
   log('watching ' + JOB_DIR);
-  log('output   ' + OUT_DIR + '/<id>' + EXT + '  [profile: ' + PROF.name + ']');
+  log('output   ' + OUT_DIR + '/<id>' + EXT + ' | <id>' + PROF.audioExt +
+      '  [profile: ' + PROF.name + ', mp3 ' + PROF.audio.ab + 'k]');
   loop();
 }
 
