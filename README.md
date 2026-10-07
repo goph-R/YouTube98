@@ -231,6 +231,8 @@ write them out for you.
 | `YT98_MP3_CODEC` | `libmp3lame` | audio encoder |
 | `YT98_KEEP_DAYS` | `0` | optional age cap, 0 = off |
 | `YT98_THUMB_WORKERS` | `6` | parallel thumbnail fetches |
+| `YT98_THUMB_W`, `YT98_THUMB_H` | `320`, `180` | stored thumbnail size |
+| `YT98_THUMB_Q` | `4` | thumbnail JPEG quality, 2 (best) to 31 |
 
 ### Encode profiles
 

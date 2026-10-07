@@ -79,10 +79,17 @@ CHANNEL_ID_RE = re.compile(r"^UC[A-Za-z0-9_-]{22}$")
 ATOM = "{http://www.w3.org/2005/Atom}"
 YT = "{http://www.youtube.com/xml/schemas/2015}"
 
-# 16:9 at 160px wide. Sourced from mqdefault (320x180) so there are no
-# letterbox bars to waste pixels on, and the download stays small.
-THUMB_W, THUMB_H = 160, 90
+# Sourced from mqdefault (320x180) so there are no letterbox bars to waste
+# pixels on. Stored at the source size by default now that the page
+# stretches thumbnails to the cell width: at 1024x768 a cell is ~250px, so
+# a 160px image would be upscaled and look soft. Drop these back to 160/90
+# if the retro box struggles to decode a page of the larger ones.
+THUMB_W = int(os.environ.get("YT98_THUMB_W", "320"))
+THUMB_H = int(os.environ.get("YT98_THUMB_H", "180"))
 THUMB_SRC = "https://i.ytimg.com/vi/{id}/mqdefault.jpg"
+# ffmpeg -q:v, 2 (best) to 31 (worst). Raising this is the cheapest way to
+# cut page weight without losing resolution.
+THUMB_Q = os.environ.get("YT98_THUMB_Q", "4")
 
 HTTP_TIMEOUT = 20
 
@@ -361,7 +368,7 @@ def make_thumb(video_id):
         "ffmpeg", "-y", "-loglevel", "error",
         "-i", tmp,
         "-vf", "scale=%d:%d" % (THUMB_W, THUMB_H),
-        "-q:v", "4",
+        "-q:v", THUMB_Q,
         out,
     ]
     try:

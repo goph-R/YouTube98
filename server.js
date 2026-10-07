@@ -560,12 +560,20 @@ function renderPage(feed, page) {
            * `pointer` — IE5.0 does not know `pointer`. The class is
            * swapped to "t" client-side the moment a job reaches READY.
            */
+          /*
+           * width="100%" rather than a fixed pixel size, so the image
+           * fills whatever the cell is at the current window width. No
+           * height attribute: the browser derives it from the image's own
+           * aspect, which is what keeps 16:9 intact. The cost is that
+           * vertical space is not reserved until each image loads, so the
+           * grid settles as the page comes in.
+           */
           h.push('<img id="i_' + j + '" src="' + esc(v.src) + '"' +
-                 ' width="160" height="90" border="0" alt=""' +
+                 ' width="100%" border="0" alt=""' +
                  (isReady ? ' class="t" title="Click to copy path"' : '') +
                  ' onclick="copyPath(\'' + j + '\')"><br>');
         } else {
-          h.push('<table border="0" width="160" height="90" bgcolor="#808080"><tr>' +
+          h.push('<table border="0" width="100%" height="90" bgcolor="#808080"><tr>' +
                  '<td align="center"><font color="#ffffff">no image</font></td></tr></table>');
         }
         h.push('<span class="ttl">' + esc(clip(v.title, 70)) + '</span><br>');
