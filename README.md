@@ -185,9 +185,10 @@ Player Classic**. Each has a list of the usual install locations, and
 both fall back to the shell association — so it works before either is
 installed.
 
-Set `WINAMP_ENQUEUE = True` at the top of `play.vbs` to enqueue audio
-(`/ADD`) instead of replacing the playlist, which is nicer for queueing
-several MP3s from the feed in one pass.
+`WINAMP_ENQUEUE` at the top of `play.vbs` is **`True`**, so audio is
+passed to Winamp with `/ADD`: each `Play` **enqueues** rather than
+replacing the playlist, which is what you want when grabbing several
+tracks off one page. Set it `False` for play-now-and-replace behaviour.
 
 The `.reg` file uses the `REGEDIT4` header on purpose: the
 `Windows Registry Editor Version 5.00` format is Windows 2000+ and Win98's

@@ -20,7 +20,7 @@ Option Explicit
 ' Set to True to ENQUEUE audio in Winamp (/ADD) instead of replacing the
 ' playlist and playing immediately. Handy for queueing several MP3s from
 ' the feed in one pass.
-Const WINAMP_ENQUEUE = False
+Const WINAMP_ENQUEUE = True
 
 Dim raw, p, ext, sh, fso, i, candidates, player, args
 
