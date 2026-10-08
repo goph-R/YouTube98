@@ -13,6 +13,9 @@ local player.
 Developed against a Pentium II 350 MHz with 192 MB RAM and an ATi Radeon
 9200, running Win98SE and IE 5.0. MPEG-1 at 352x208 plays smoothly there.
 
+![The feed in IE 5 on Windows 98SE, with a downloaded video playing in
+Media Player Classic](screenshot-v1.jpg)
+
 ```
   Win98SE box (IE5)                    server (Linux/macOS/Windows)
   ---------------------                ----------------------------
